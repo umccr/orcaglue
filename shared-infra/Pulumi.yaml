@@ -1,0 +1,4 @@
+name: shared-infra
+description: OrcaGlue shared infrastructure resources
+runtime:
+  name: python

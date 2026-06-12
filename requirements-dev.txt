@@ -1,0 +1,22 @@
+# Install all application requirements.
+-r requirements.txt
+
+# Add CI only and dev only requirements below.
+
+# Required Pulumi across the board
+pulumi>=3.0.0,<4.0.0
+pulumi-aws>=7.0.0,<8.0.0
+
+# Required shared_lib for local dev and CI
+-e shared-lib
+
+# Glue and PySpark
+# Check with Victor before touching this part. Or leave this to him.
+git+https://github.com/awslabs/aws-glue-libs.git@glue-5.0
+pyspark==3.5.4
+
+# Testing
+pytest
+
+# Boto3 is already available in targert Glue runtime. Only needed for local dev and CI.
+boto3
