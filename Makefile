@@ -5,6 +5,8 @@ install:
 
 check:
 	@pre-commit run --all-files
+	@ruff check .
+	@ruff format --check
 
 scan:
 	@trufflehog --debug --only-verified git file://./ --since-commit main --branch HEAD --fail
