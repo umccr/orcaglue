@@ -1,7 +1,9 @@
 import pulumi
 
 
-def add_default_tags(args: pulumi.ResourceTransformationArgs) -> pulumi.ResourceTransformationResult:
+def add_default_tags(
+    args: pulumi.ResourceTransformationArgs,
+) -> pulumi.ResourceTransformationResult:
     # Globally applied tags
     default_tags = {
         "umccr-org:Product": "OrcaGlue",
@@ -9,7 +11,7 @@ def add_default_tags(args: pulumi.ResourceTransformationArgs) -> pulumi.Resource
         "umccr-org:Service": "OrcaGlue",
         "umccr-org:Source": "https://github.com/umccr/orcaglue",
         "ManagedBy": "Pulumi",
-        "Project": pulumi.get_project()
+        "Project": pulumi.get_project(),
     }
 
     if "tags" in args.props:

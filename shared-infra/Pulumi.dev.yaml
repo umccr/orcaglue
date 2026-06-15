@@ -1,0 +1,4 @@
+secretsprovider: awskms://alias/pulumi-state-key # pragma: allowlist secret
+encryptedkey: AQICAHjiIoInMawFdg3zsGPUuqK2Y2wKhSCcloZUamCbvHLzOQGPWkCSwd1zmxvKGC1aDJf6AAAAfjB8BgkqhkiG9w0BBwagbzBtAgEAMGgGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMZGLiWaC7uWRK2KfmAgEQgDsbtVQ9MlaN81/LfZNF+mod8RtXr4t31zusQSL1uwRLYZEA1Osy3vF7baBw2bmIvyKfFvWQynAU22YjVw== # pragma: allowlist secret
+config:
+  aws:region: ap-southeast-2
