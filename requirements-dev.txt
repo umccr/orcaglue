@@ -20,5 +20,6 @@ pytest
 
 # Boto3 is already available in targert Glue runtime. Only needed for local dev and CI.
 boto3
+boto3-stubs
 
 ruff

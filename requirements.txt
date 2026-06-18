@@ -1,1 +1,6 @@
 # Application requirements across the board
+libumccr==0.4.1
+google-auth==2.55.0
+requests==2.34.2
+polars==1.41.2
+gspread==6.2.1
