@@ -25,13 +25,10 @@ pulumi config get aws:region
 Routine deployment. 
 ```
 pulumi stack
+pulumi stack --show-urns
 pulumi stack ls
 pulumi stack select dev
-
-pulumi install
-
 pulumi preview
 pulumi up
-
 pulumi stack output
 ```
