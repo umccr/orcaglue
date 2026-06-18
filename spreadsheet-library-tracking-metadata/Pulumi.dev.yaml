@@ -1,0 +1,11 @@
+secretsprovider: awskms://alias/pulumi-state-key # pragma: allowlist secret
+encryptedkey: AQICAHjiIoInMawFdg3zsGPUuqK2Y2wKhSCcloZUamCbvHLzOQFsUFeIMEnFvtmW8UtNtWvuAAAAfjB8BgkqhkiG9w0BBwagbzBtAgEAMGgGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMwwtafk7+kO6Au46sAgEQgDsA05zl/7FPaXJSi8kCmrt7Ei1jL6APUUALfBkshZYUZsjutbWGtU+qCCAP08UjMpjN0N6ZHNbGQFwHDQ== # pragma: allowlist secret
+config:
+  aws:region: ap-southeast-2
+  # Format: <current-project-name>:<key-name>: organization/<target-project>/<target-stack>
+  spreadsheet-library-tracking-metadata:shared-infra: organization/shared-infra/dev
+  spreadsheet-library-tracking-metadata:requirements: ../requirements.txt
+  spreadsheet-library-tracking-metadata:job-script: job/spreadsheet_library_tracking_metadata.py
+  spreadsheet-library-tracking-metadata:lz-bucket: orcahouse-dev-landing-zone-115253169271-ap-southeast-2-an
+  spreadsheet-library-tracking-metadata:rs-workgroup: orcahouse-dev
+  spreadsheet-library-tracking-metadata:rs-role: arn:aws:iam::115253169271:role/dev-redshift-namespace-role
