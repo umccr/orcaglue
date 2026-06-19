@@ -1,0 +1,4 @@
+name: sample-job # FIXME <-- update this
+description: A minimal Pulumi project template for AWS Glue Job ETL pipeline # FIXME <-- update this
+runtime:
+  name: python

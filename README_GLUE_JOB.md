@@ -1,6 +1,6 @@
 # AWS Glue Job Run
 
-* You use AWS Glue Console UI to run a Glue job.
+* You can use AWS Glue Console UI to run a Glue job.
 * You can use the AWS CLI to run a Glue job.
 
 ```
