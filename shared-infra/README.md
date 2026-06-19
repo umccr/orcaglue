@@ -24,11 +24,47 @@ pulumi config get aws:region
 
 Routine deployment. 
 ```
-pulumi stack
-pulumi stack --show-urns
-pulumi stack ls
 pulumi stack select dev
+pulumi stack ls
 pulumi preview
 pulumi up
 pulumi stack output
+pulumi stack
+pulumi stack --show-urns
+```
+
+## Refresh Grant Glue Role
+
+Sometimes we need to refresh the TSA grant statement for the Glue execution role.
+
+Do like so.
+
+Select the stack.
+```
+pulumi stack select dev
+```
+
+Grab the grant statement urn from the stack output.
+```
+pulumi stack --show-urns
+```
+
+Refresh the grant statement. _This is idempotent._
+```
+pulumi up --replace 'urn:pulumi:dev::shared-infra::aws:redshiftdata/statement:Statement::orcaglue-shared-infra-glue-role-tsa-grants-dev'
+```
+
+Alternatively, run this directly via Redshift Query Editor.
+
+```sql
+GRANT USAGE ON SCHEMA tsa TO "IAMR:orcaglue-shared-infra-glue-job-role-dev";
+
+GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE
+ON ALL TABLES IN SCHEMA tsa
+TO "IAMR:orcaglue-shared-infra-glue-job-role-dev";
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA tsa
+GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE
+ON TABLES
+TO "IAMR:orcaglue-shared-infra-glue-job-role-dev";
 ```
