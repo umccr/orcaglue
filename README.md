@@ -1,3 +1,10 @@
+<!-- TOC -->
+* [OrcaGlue](#orcaglue)
+  * [Development](#development)
+  * [New ETL Module](#new-etl-module)
+  * [Simple Data Loading](#simple-data-loading)
+<!-- TOC -->
+
 # OrcaGlue
 
 OrcaGlue – Frontline ETL for Pipeline Automation Data Warehouse
@@ -75,3 +82,11 @@ Clean up the project directory.
 cd ..
 rm -rf sample-job
 ```
+
+## Simple Data Loading
+
+* Sometimes, you might have a use case that requires a simple data loading job without going through the Glue ETL pipeline, yet.
+* This may be a use case that you are still exploring before fully committing to the Glue ETL pipeline setup.
+* For these kinds of use cases, it is possible to leverage the simplified Redshift data loading via Query Editor.
+
+See [README_REDSHIFT.md](README_REDSHIFT.md) for more details.
