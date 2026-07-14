@@ -27,6 +27,12 @@ def test_normalise_column_name():
     assert job.normalise_column_name("__UNNAMED__: 1") == "unnamed_1"
 
 
+def test_parse_bool_supports_safe_load_default():
+    assert job.parse_bool(None, default=False) is False
+    assert job.parse_bool("true", default=False) is True
+    assert job.parse_bool("false", default=True) is False
+
+
 def test_transform_combines_files_and_writes_expected_columns(tmp_path, monkeypatch):
     monkeypatch.setattr(job, "BASE_NAME", job.BASE_NAME_DEFAULT)
     monkeypatch.setattr(
@@ -112,3 +118,32 @@ def test_load_sql_uses_delete_insert_not_truncate():
     assert "COPY tsa.csv__ica_usage_report__staging" in stage_sql
     assert "INSERT INTO tsa.csv__ica_usage_report__previous" in swap_sql
     assert "INSERT INTO tsa.csv__ica_usage_report" in swap_sql
+
+
+def test_wait_for_query_times_out_with_last_status(monkeypatch):
+    class PendingClient:
+        def describe_statement(self, Id: str) -> dict[str, str]:
+            assert Id == "statement-1"
+            return {"Status": "STARTED"}
+
+    ticks = iter([0, 1, 3])
+    sleeps = []
+
+    monkeypatch.setattr(job.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(job.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(
+        TimeoutError,
+        match=(
+            "Timed out after 2 seconds waiting for Redshift Data API statement "
+            "statement-1; last status=STARTED"
+        ),
+    ):
+        job._wait_for_query(
+            PendingClient(),
+            "statement-1",
+            timeout_seconds=2,
+            poll_interval_seconds=1,
+        )
+
+    assert sleeps == [1]

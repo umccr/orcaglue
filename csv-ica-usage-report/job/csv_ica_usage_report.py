@@ -58,6 +58,8 @@ S3_SOURCE_PREFIX_DEFAULT = "ica-usage-reports/"
 SCHEMA_NAME = "tsa"
 DB_NAME = "orcavault"
 REGION_NAME = "ap-southeast-2"
+REDSHIFT_STATEMENT_TIMEOUT_SECONDS = 10 * 60
+REDSHIFT_POLL_INTERVAL_SECONDS = 2
 
 EXPECTED_COLUMNS = (
     "usage_id",
@@ -384,20 +386,42 @@ def upload_artifacts(bucket: str, result: TransformResult) -> dict[str, str]:
     return artifacts
 
 
-def _wait_for_query(client: Any, statement_id: str) -> None:
+def _wait_for_query(
+    client: Any,
+    statement_id: str,
+    timeout_seconds: int = REDSHIFT_STATEMENT_TIMEOUT_SECONDS,
+    poll_interval_seconds: int = REDSHIFT_POLL_INTERVAL_SECONDS,
+) -> None:
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be greater than zero")
+    if poll_interval_seconds <= 0:
+        raise ValueError("poll_interval_seconds must be greater than zero")
+
+    deadline = time.monotonic() + timeout_seconds
+    last_status = "UNKNOWN"
+
     while True:
         response = client.describe_statement(Id=statement_id)
-        status = response["Status"]
-        if status == "FINISHED":
+        last_status = response["Status"]
+        if last_status == "FINISHED":
             print(f"Statement {statement_id} finished successfully.")
             return
-        if status in ("FAILED", "ABORTED"):
+        if last_status in ("FAILED", "ABORTED"):
             raise RuntimeError(
                 f"Redshift Data API statement {statement_id} failed. "
                 f"Error: {response.get('Error')}"
             )
-        print(f"Statement {statement_id} status: {status}; waiting...")
-        time.sleep(2)
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            raise TimeoutError(
+                f"Timed out after {timeout_seconds} seconds waiting for "
+                f"Redshift Data API statement {statement_id}; "
+                f"last status={last_status}"
+            )
+
+        print(f"Statement {statement_id} status: {last_status}; waiting...")
+        time.sleep(min(poll_interval_seconds, remaining_seconds))
 
 
 def _batch_execute(client: Any, workgroup: str, sqls: list[str], name: str) -> None:
@@ -525,7 +549,7 @@ class GlueIcaUsageReport(GlueJobBase):
         self.workgroup = args["rs_workgroup"]
         self.role = args["rs_role"]
         self.source_prefix = args.get("source_prefix", S3_SOURCE_PREFIX_DEFAULT)
-        self.load_enabled = parse_bool(args.get("load_enabled"), default=True)
+        self.load_enabled = parse_bool(args.get("load_enabled"), default=False)
 
         job_name = args.get("JOB_NAME", "GlueIcaUsageReport")
         self.init(job_name, args)
