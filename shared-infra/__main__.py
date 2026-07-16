@@ -96,25 +96,18 @@ glue_inline_policy = aws.iam.RolePolicy(
                 {
                     "Sid": "RedshiftDataAPIExecute",
                     "Effect": "Allow",
-                    "Action": sorted(
-                        [
-                            "redshift-data:BatchExecuteStatement",
-                            "redshift-data:ExecuteStatement",
-                        ]
-                    ),
+                    "Action": [
+                        "redshift-data:ExecuteStatement",
+                    ],
                     "Resource": [rs_workgroup.arn],
                 },
                 # Redshift Data API — DescribeStatement must be wildcard
                 {
-                    "Sid": "RedshiftDataAPIStatementAccess",
+                    "Sid": "RedshiftDataAPIDescribe",
                     "Effect": "Allow",
-                    "Action": sorted(
-                        [
-                            "redshift-data:CancelStatement",
-                            "redshift-data:DescribeStatement",
-                            "redshift-data:GetStatementResult",
-                        ]
-                    ),
+                    "Action": [
+                        "redshift-data:DescribeStatement",
+                    ],
                     "Resource": ["*"],
                 },
                 # Redshift Serverless — scoped to workgroup

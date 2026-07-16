@@ -4,10 +4,9 @@
 
 - [ICA Usage Report CSV](#ica-usage-report-csv)
   - [What This Job Does](#what-this-job-does)
-    - [Redshift Safety Tables](#redshift-safety-tables)
     - [Load and Validation Flow](#load-and-validation-flow)
   - [Deployment](#deployment)
-    - [Shared Infrastructure Prerequisite](#shared-infrastructure-prerequisite)
+    - [Notice](#notice)
   - [Redshift Table Setup](#redshift-table-setup)
   - [Glue Job Run](#glue-job-run)
   - [Local Development](#local-development)
@@ -28,7 +27,7 @@ The job:
 - Trims whitespace and removes fully empty rows.
 - Writes a consolidated CSV, generated SQL schema and JSON audit manifest.
 - Uploads the generated artifacts under the Glue-managed `orcaglue/` prefix.
-- Loads the validated snapshot into Redshift Serverless through the Data API.
+- Loads the current snapshot into Redshift Serverless through the Data API and verifies the published row count.
 
 The landing-zone bucket should be organised like this:
 
@@ -52,28 +51,18 @@ Raw source reports belong under `ica-usage-reports/` at the bucket root. Do not 
 
 The published TSA table is `orcavault.tsa.csv__ica_usage_report`.
 
-### Redshift Safety Tables
-
-The load uses the main target and two safety tables so that a new snapshot can be checked before it replaces published data.
-
-| Table                                 | Purpose                                                                     |
-| ------------------------------------- | --------------------------------------------------------------------------- |
-| `csv__ica_usage_report` (main target) | Contains the published snapshot used by downstream consumers.               |
-| `csv__ica_usage_report__staging`      | Receives and validates the new snapshot before the main target is modified. |
-| `csv__ica_usage_report__previous`     | Preserves the last published snapshot for manual recovery or comparison.    |
-
-In this implementation, all three tables are created and used. `__staging` prevents a failed or incomplete `COPY` from immediately replacing published data. `__previous` provides a recovery point after a successful swap, but the job does not roll back from it automatically.
-
 ### Load and Validation Flow
+
+This TSA job publishes the current snapshot only. The change history is expected to be persisted in the PSA layer.
 
 The job publishes one complete snapshot per run:
 
 1. Transform all source CSV files into one normalised CSV, reject unexpected columns and upload the CSV, SQL and manifest artifacts.
-2. Load the CSV into `__staging`, then compare the staging row count with the transformed CSV row count. A mismatch stops the run before the target table is modified.
-3. Replace `__previous` with the current target, then replace the target with the validated staging snapshot.
-4. Check the final target row count and record source objects, SHA-256 checksums, row counts and duplicate `(usage_id, billing_date)` counts in the manifest.
+2. Refresh `orcavault.tsa.csv__ica_usage_report` directly with `TRUNCATE TABLE` and `COPY` statements through the Redshift Data API.
+3. Check the final target row count against the transformed CSV row count.
+4. Record source objects, SHA-256 checksums, row counts and duplicate `(usage_id, billing_date)` counts in the manifest.
 
-The replacement SQL uses batched `DELETE` and `INSERT` statements instead of `TRUNCATE`, because `TRUNCATE` commits immediately in Redshift. Row-count checks validate snapshot completeness, not field-level business meaning. The job also records duplicate `(usage_id, billing_date)` values for audit only; it does not deduplicate rows.
+Row-count checks validate snapshot completeness, not field-level business meaning. The job records duplicate `(usage_id, billing_date)` values for audit only; it does not deduplicate rows.
 
 ## Deployment
 
@@ -94,27 +83,16 @@ Log in to the Pulumi backend:
 pulumi login s3://pulumi-state-115253169271-ap-southeast-2-an/orcaglue
 ```
 
-### Shared Infrastructure Prerequisite
-
-> **Important**
+> **Notice** The shared infrastructure stack must already exist because this module reads its `shared_glue_role_arn` output. No CSV-specific `shared-infra` change or redeploy is required; the existing Glue role permissions are enough for this job.
 >
-> Deploy the updated `shared-infra` stack before deploying this job or running it with Redshift loading enabled. This grants the Glue execution role the required Redshift Data API permissions: `BatchExecuteStatement`, `ExecuteStatement`, `DescribeStatement`, `GetStatementResult`, and `CancelStatement` for operational cancellation.
-
-From the repository root, preview and apply the existing shared infrastructure
-dev stack:
-
-```bash
-cd shared-infra
-pulumi stack select dev
-pulumi preview
-pulumi up
-pulumi stack output shared_glue_role_arn
-cd ..
-```
-
-Review the preview before approving the update. It should include an update to the Glue role policy. This shared-infrastructure deployment is required once after the permission changes are introduced; it does not need to be repeated for every Glue job run.
-
-Change to the module root and initialise the dev stack once, if it does not already exist:
+> ```bash
+> cd shared-infra
+> pulumi stack select dev
+> pulumi stack output shared_glue_role_arn
+> cd ..
+> ```
+>
+> Change to the module root and initialise the dev stack once, if it does not already exist.
 
 ```bash
 cd csv-ica-usage-report
@@ -136,8 +114,9 @@ A prod stack configuration is intentionally not included because the prod worksp
 
 ## Redshift Table Setup
 
-Run [job/init.sql](job/init.sql) in Redshift Query Editor before the first load.
-Complete the shared infrastructure prerequisite before running the load.
+Run [job/init.sql](job/init.sql) in Redshift Query Editor before the first load. Confirm the deployment notice before running the load.
+
+Earlier development versions created `csv__ica_usage_report__staging` and `csv__ica_usage_report__previous`. They are no longer used by this job and are not created by [job/init.sql](job/init.sql).
 
 ## Glue Job Run
 

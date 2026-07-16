@@ -167,9 +167,9 @@ def sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def table_name(suffix: str = "", include_database: bool = False) -> str:
+def table_name(include_database: bool = False) -> str:
     prefix = f"{DB_NAME}." if include_database else ""
-    return f"{prefix}{SCHEMA_NAME}.{BASE_NAME}{suffix}"
+    return f"{prefix}{SCHEMA_NAME}.{BASE_NAME}"
 
 
 def quoted_columns() -> str:
@@ -187,50 +187,34 @@ def create_table_sql(name: str) -> str:
 
 
 def init_sql() -> str:
-    return "\n\n".join(
-        [
-            create_table_sql(table_name(include_database=True)),
-            create_table_sql(table_name("__staging", include_database=True)),
-            create_table_sql(table_name("__previous", include_database=True)),
-        ]
-    )
+    return create_table_sql(table_name(include_database=True))
 
 
-def build_staging_load_sql(s3_csv_uri: str, role: str) -> list[str]:
-    staging_table = table_name("__staging")
-    return [
-        f"DELETE FROM {staging_table};",
-        f"""
-COPY {staging_table} ({quoted_columns()})
-FROM '{sql_literal(s3_csv_uri)}'
-IAM_ROLE '{sql_literal(role)}'
-FORMAT AS CSV
-IGNOREHEADER 1
-EMPTYASNULL
-BLANKSASNULL
-REGION '{REGION_NAME}';
-""",
-    ]
-
-
-def build_target_swap_sql() -> list[str]:
+def build_target_load_sql(s3_csv_uri: str, role: str) -> list[str]:
     target_table = table_name()
-    staging_table = table_name("__staging")
-    previous_table = table_name("__previous")
-    columns = quoted_columns()
-
     return [
-        f"DELETE FROM {previous_table};",
-        (
-            f"INSERT INTO {previous_table} ({columns}) "
-            f"SELECT {columns} FROM {target_table};"
-        ),
-        f"DELETE FROM {target_table};",
-        (
-            f"INSERT INTO {target_table} ({columns}) "
-            f"SELECT {columns} FROM {staging_table};"
-        ),
+        f"TRUNCATE TABLE {target_table};",
+        f"""
+        COPY {target_table} ({quoted_columns()})
+        FROM '{sql_literal(s3_csv_uri)}'
+        IAM_ROLE '{sql_literal(role)}'
+        FORMAT AS CSV
+        IGNOREHEADER 1
+        EMPTYASNULL
+        BLANKSASNULL
+        REGION '{REGION_NAME}';
+        """,
     ]
+
+
+def build_target_count_validation_sql(expected_rows: int) -> str:
+    target_table = table_name()
+    return f"""SELECT 1
+            WHERE (
+                SELECT COUNT(*)
+                FROM {target_table}
+            ) = {expected_rows};
+            """
 
 
 def extract(s3_bucket_name: str, source_prefix: str) -> list[DownloadedObject]:
@@ -345,8 +329,6 @@ def transform(downloaded: list[DownloadedObject]) -> TransformResult:
     manifest = {
         "base_name": BASE_NAME,
         "target_table": table_name(include_database=True),
-        "staging_table": table_name("__staging", include_database=True),
-        "previous_table": table_name("__previous", include_database=True),
         "source_prefix": S3_SOURCE_PREFIX,
         "source_objects": [asdict(item.source) for item in downloaded],
         "source_count": len(downloaded),
@@ -391,7 +373,7 @@ def _wait_for_query(
     statement_id: str,
     timeout_seconds: int = REDSHIFT_STATEMENT_TIMEOUT_SECONDS,
     poll_interval_seconds: int = REDSHIFT_POLL_INTERVAL_SECONDS,
-) -> None:
+) -> dict[str, Any]:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be greater than zero")
     if poll_interval_seconds <= 0:
@@ -405,7 +387,7 @@ def _wait_for_query(
         last_status = response["Status"]
         if last_status == "FINISHED":
             print(f"Statement {statement_id} finished successfully.")
-            return
+            return response
         if last_status in ("FAILED", "ABORTED"):
             raise RuntimeError(
                 f"Redshift Data API statement {statement_id} failed. "
@@ -424,32 +406,19 @@ def _wait_for_query(
         time.sleep(min(poll_interval_seconds, remaining_seconds))
 
 
-def _batch_execute(client: Any, workgroup: str, sqls: list[str], name: str) -> None:
-    response = client.batch_execute_statement(
-        WorkgroupName=workgroup,
-        Database=DB_NAME,
-        Sqls=sqls,
-        StatementName=name,
-    )
-    _wait_for_query(client, response["Id"])
-
-
-def _fetch_count(client: Any, workgroup: str, sql: str) -> int:
+def _execute_statement(
+    client: Any,
+    workgroup: str,
+    sql: str,
+    name: str,
+) -> dict[str, Any]:
     response = client.execute_statement(
         WorkgroupName=workgroup,
         Database=DB_NAME,
         Sql=sql,
+        StatementName=name,
     )
-    statement_id = response["Id"]
-    _wait_for_query(client, statement_id)
-
-    result = client.get_statement_result(Id=statement_id)
-    value = result["Records"][0][0]
-    if "longValue" in value:
-        return int(value["longValue"])
-    if "stringValue" in value:
-        return int(value["stringValue"])
-    raise RuntimeError(f"Cannot parse Redshift count result: {value}")
+    return _wait_for_query(client, response["Id"])
 
 
 def load_to_redshift(
@@ -460,45 +429,30 @@ def load_to_redshift(
 ) -> None:
     redshift_data_client = get_boto3_client("redshift-data")
     target_table = table_name()
-    staging_table = table_name("__staging")
 
-    print(f"Loading staging table: {staging_table} from {csv_s3_uri}")
-    _batch_execute(
-        redshift_data_client,
-        workgroup,
-        build_staging_load_sql(csv_s3_uri, role),
-        f"{BASE_NAME}-stage-load",
-    )
-
-    staging_count = _fetch_count(
-        redshift_data_client,
-        workgroup,
-        f"SELECT COUNT(*) FROM {staging_table};",
-    )
-    if staging_count != expected_rows:
-        raise RuntimeError(
-            f"Staging row count mismatch: expected {expected_rows}, got {staging_count}"
+    print(f"Loading target table: {target_table} from {csv_s3_uri}")
+    for index, sql in enumerate(build_target_load_sql(csv_s3_uri, role), start=1):
+        _execute_statement(
+            redshift_data_client,
+            workgroup,
+            sql,
+            f"{BASE_NAME}-target-load-{index}",
         )
 
-    print(f"Replacing target table: {target_table}")
-    _batch_execute(
+    validation_response = _execute_statement(
         redshift_data_client,
         workgroup,
-        build_target_swap_sql(),
-        f"{BASE_NAME}-target-swap",
+        build_target_count_validation_sql(expected_rows),
+        f"{BASE_NAME}-target-count-validation",
     )
-
-    target_count = _fetch_count(
-        redshift_data_client,
-        workgroup,
-        f"SELECT COUNT(*) FROM {target_table};",
-    )
-    if target_count != expected_rows:
+    result_rows = int(validation_response.get("ResultRows", -1))
+    if result_rows != 1:
         raise RuntimeError(
-            f"Target row count mismatch: expected {expected_rows}, got {target_count}"
+            f"Target row count mismatch: expected {expected_rows}. "
+            f"Validation query returned {result_rows} rows."
         )
 
-    print(f"Load complete: {target_table} rows={target_count}")
+    print(f"Load complete: {target_table} rows={expected_rows}")
 
 
 def load(bucket: str, workgroup: str, role: str, result: TransformResult) -> None:

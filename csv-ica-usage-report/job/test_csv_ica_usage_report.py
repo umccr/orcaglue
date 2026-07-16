@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,11 @@ def test_transform_combines_files_and_writes_expected_columns(tmp_path, monkeypa
     assert "u-1" in output[1]
     assert "workflow id: wfr.1" in output[1]
 
+    manifest = json.loads(Path(result.manifest_file).read_text(encoding="utf-8"))
+    assert manifest["target_table"] == "orcavault.tsa.csv__ica_usage_report"
+    assert "staging_table" not in manifest
+    assert "previous_table" not in manifest
+
 
 def test_transform_rejects_schema_drift(tmp_path, monkeypatch):
     monkeypatch.setattr(
@@ -104,20 +110,51 @@ def test_transform_rejects_schema_drift(tmp_path, monkeypatch):
         job.transform([downloaded(source, "ica-usage-reports/drift.csv")])
 
 
-def test_load_sql_uses_delete_insert_not_truncate():
-    stage_sql = "\n".join(
-        job.build_staging_load_sql(
+def test_load_sql_truncates_and_reloads_target_without_safety_tables():
+    init_sql = job.init_sql()
+    load_sql = "\n".join(
+        job.build_target_load_sql(
             "s3://example-bucket/orcaglue/csv__ica_usage_report/dev/report.csv",
             "arn:aws:iam::115253169271:role/dev-redshift-namespace-role",
         )
     )
-    swap_sql = "\n".join(job.build_target_swap_sql())
 
-    assert "TRUNCATE" not in stage_sql.upper()
-    assert "TRUNCATE" not in swap_sql.upper()
-    assert "COPY tsa.csv__ica_usage_report__staging" in stage_sql
-    assert "INSERT INTO tsa.csv__ica_usage_report__previous" in swap_sql
-    assert "INSERT INTO tsa.csv__ica_usage_report" in swap_sql
+    assert "__staging" not in init_sql
+    assert "__previous" not in init_sql
+    assert "__staging" not in load_sql
+    assert "__previous" not in load_sql
+    assert "DELETE FROM" not in load_sql.upper()
+    assert "TRUNCATE TABLE tsa.csv__ica_usage_report" in load_sql
+    assert "COPY tsa.csv__ica_usage_report" in load_sql
+
+
+def test_load_to_redshift_uses_existing_shared_infra_permissions(monkeypatch):
+    class ExistingPermissionClient:
+        def __init__(self):
+            self.sqls = []
+
+        def execute_statement(self, **kwargs):
+            self.sqls.append(kwargs["Sql"])
+            return {"Id": f"statement-{len(self.sqls)}"}
+
+        def describe_statement(self, Id: str) -> dict[str, str | int]:
+            assert Id.startswith("statement-")
+            return {"Status": "FINISHED", "ResultRows": 1}
+
+    client = ExistingPermissionClient()
+    monkeypatch.setattr(job, "get_boto3_client", lambda service: client)
+
+    job.load_to_redshift(
+        workgroup="orcahouse-dev",
+        role="arn:aws:iam::115253169271:role/dev-redshift-namespace-role",
+        csv_s3_uri="s3://example-bucket/orcaglue/csv__ica_usage_report/dev/report.csv",
+        expected_rows=2,
+    )
+
+    assert len(client.sqls) == 3
+    assert client.sqls[0] == "TRUNCATE TABLE tsa.csv__ica_usage_report;"
+    assert "COPY tsa.csv__ica_usage_report" in client.sqls[1]
+    assert "SELECT COUNT(*)" in client.sqls[2]
 
 
 def test_wait_for_query_times_out_with_last_status(monkeypatch):
