@@ -1,3 +1,4 @@
+import csv
 import json
 from pathlib import Path
 
@@ -44,13 +45,21 @@ def test_transform_combines_files_and_writes_expected_columns(tmp_path, monkeypa
 
     first = tmp_path / "first.csv"
     second = tmp_path / "second.csv"
+    execution_id = "123e4567-e89b-12d3-a456-426614174000"
+    portal_run_id = "20260720ABCDEF12"
+    structured_metadata = (
+        f"id:{execution_id}|license:license-id|pipelineUuid:pipeline-id|"
+        "status:Succeeded|"
+        "reference:research--workflow--dragen-wgs--4.2.4--"
+        f"{portal_run_id}-{execution_id}"
+    )
 
     write_csv(
         first,
         "\n".join(
             [
                 "Usage ID,Billing Date,Cost,Metadata",
-                " u-1 , 2026-07-01 , 1.20 , workflow id: wfr.1 ",
+                f" u-1 , 2026-07-01 , 1.20 , {structured_metadata} ",
                 " , , , ",
             ]
         ),
@@ -77,13 +86,21 @@ def test_transform_combines_files_and_writes_expected_columns(tmp_path, monkeypa
     assert Path(result.sql_file).exists()
     assert Path(result.manifest_file).exists()
 
-    output = Path(result.csv_file).read_text(encoding="utf-8").splitlines()
-    assert output[0].split(",") == list(job.EXPECTED_COLUMNS)
-    assert "u-1" in output[1]
-    assert "workflow id: wfr.1" in output[1]
+    with Path(result.csv_file).open(encoding="utf-8", newline="") as handle:
+        output = list(csv.DictReader(handle))
+
+    assert list(output[0]) == list(job.OUTPUT_COLUMNS)
+    assert output[0]["usage_id"] == "u-1"
+    assert output[0]["metadata"] == structured_metadata
+    assert output[0]["ica_execution_id"] == execution_id
+    assert output[0]["portal_run_id"] == portal_run_id
+    assert output[0]["ref_format"] == "umccr_workflow_run"
+    assert output[0]["id_matches_reference"] == "true"
+    assert output[1]["ref_format"] == "no_reference"
 
     manifest = json.loads(Path(result.manifest_file).read_text(encoding="utf-8"))
     assert manifest["target_table"] == "orcavault.tsa.csv__ica_usage_report"
+    assert manifest["expected_columns"] == list(job.OUTPUT_COLUMNS)
     assert "staging_table" not in manifest
     assert "previous_table" not in manifest
 
@@ -126,6 +143,8 @@ def test_load_sql_truncates_and_reloads_target_without_safety_tables():
     assert "DELETE FROM" not in load_sql.upper()
     assert "TRUNCATE TABLE tsa.csv__ica_usage_report" in load_sql
     assert "COPY tsa.csv__ica_usage_report" in load_sql
+    assert '"ica_execution_id"' in load_sql
+    assert '"id_matches_reference"' in load_sql
 
 
 def test_load_to_redshift_uses_existing_shared_infra_permissions(monkeypatch):

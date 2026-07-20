@@ -25,6 +25,7 @@ The job:
 - Reads every CSV file under the configured `ica-usage-reports/` source prefix.
 - Treats the source columns as strings and normalises the known column names.
 - Trims whitespace and removes fully empty rows.
+- Parses the ICA `metadata` column using the OrcaVault metadata contract.
 - Writes a consolidated CSV, generated SQL schema and JSON audit manifest.
 - Uploads the generated artifacts under the Glue-managed `orcaglue/` prefix.
 - Loads the current snapshot into Redshift Serverless through the Data API and verifies the published row count.
@@ -42,6 +43,7 @@ orcahouse-dev-landing-zone-.../
         └── dev/
             ├── requirements.txt
             ├── csv_ica_usage_report.py
+            ├── ica_cost_metadata.py
             ├── orcavault_tsa_csv__ica_usage_report.csv
             ├── orcavault_tsa_csv__ica_usage_report.sql
             └── orcavault_tsa_csv__ica_usage_report.manifest.json
@@ -115,6 +117,10 @@ A prod stack configuration is intentionally not included because the prod worksp
 ## Redshift Table Setup
 
 Run [job/init.sql](job/init.sql) in Redshift Query Editor before the first load. Confirm the deployment notice before running the load.
+
+The metadata parser adds columns to the TSA contract. `CREATE TABLE IF NOT EXISTS`
+does not update an existing table, so update or recreate an older dev table before
+the first parser-enabled load.
 
 Earlier development versions created `csv__ica_usage_report__staging` and `csv__ica_usage_report__previous`. They are no longer used by this job and are not created by [job/init.sql](job/init.sql).
 
@@ -206,7 +212,7 @@ make run-load
 Run the focused unit tests from the module root in the Conda environment:
 
 ```bash
-python -m pytest -q job/test_csv_ica_usage_report.py
+python -m pytest -q job/test_*.py
 ```
 
 ## Destroy

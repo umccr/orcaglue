@@ -13,6 +13,8 @@ from typing import Any
 
 import polars as pl
 
+from ica_cost_metadata import parse_ica_cost_metadata
+
 try:
     import boto3
 except ModuleNotFoundError:  # pragma: no cover
@@ -82,6 +84,25 @@ EXPECTED_COLUMNS = (
     "region",
     "metadata",
     "billing_date",
+)
+
+PARSED_METADATA_COLUMN_MAPPING = (
+    ("id", "ica_execution_id"),
+    ("license", "license"),
+    ("pipeline_uuid", "pipeline_uuid"),
+    ("status", "status"),
+    ("domain", "domain"),
+    ("type", "type"),
+    ("workflow_name", "workflow_name"),
+    ("workflow_version", "workflow_version"),
+    ("portal_run_id", "portal_run_id"),
+    ("ref_format", "ref_format"),
+    ("reference_raw", "reference_raw"),
+    ("ref_uuid", "ref_uuid"),
+    ("id_matches_reference", "id_matches_reference"),
+)
+OUTPUT_COLUMNS = EXPECTED_COLUMNS + tuple(
+    target for _, target in PARSED_METADATA_COLUMN_MAPPING
 )
 
 # Resolved at runtime in GlueIcaUsageReport constructor.
@@ -173,12 +194,12 @@ def table_name(include_database: bool = False) -> str:
 
 
 def quoted_columns() -> str:
-    return ", ".join(f'"{column}"' for column in EXPECTED_COLUMNS)
+    return ", ".join(f'"{column}"' for column in OUTPUT_COLUMNS)
 
 
 def create_table_sql(name: str) -> str:
     columns = ",\n    ".join(
-        f"{column.ljust(28)} varchar(65535)" for column in EXPECTED_COLUMNS
+        f"{column.ljust(28)} varchar(65535)" for column in OUTPUT_COLUMNS
     )
     return f"""CREATE TABLE IF NOT EXISTS {name}
 (
@@ -307,6 +328,20 @@ def transform(downloaded: list[DownloadedObject]) -> TransformResult:
         print(item.local_path, df.columns, f"rows={df.height}")
 
     df = pl.concat(frames)
+
+    parsed_metadata = [
+        parse_ica_cost_metadata(metadata)
+        for metadata in df.get_column("metadata").to_list()
+    ]
+    parsed_columns = []
+    for source_column, target_column in PARSED_METADATA_COLUMN_MAPPING:
+        values = [row[source_column] for row in parsed_metadata]
+        if source_column == "id_matches_reference":
+            values = [None if value is None else str(value).lower() for value in values]
+        parsed_columns.append(pl.Series(target_column, values, dtype=pl.String))
+
+    df = df.hstack(parsed_columns).select(list(OUTPUT_COLUMNS))
+
     duplicate_count = (
         0
         if df.is_empty()
@@ -334,7 +369,7 @@ def transform(downloaded: list[DownloadedObject]) -> TransformResult:
         "source_count": len(downloaded),
         "row_count": df.height,
         "duplicate_usage_billing_count": duplicate_count,
-        "expected_columns": list(EXPECTED_COLUMNS),
+        "expected_columns": list(OUTPUT_COLUMNS),
         "csv_sha256": sha256_file(csv_file),
     }
 
