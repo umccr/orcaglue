@@ -329,16 +329,21 @@ def transform(downloaded: list[DownloadedObject]) -> TransformResult:
 
     df = pl.concat(frames)
 
-    parsed_metadata = [
-        parse_ica_cost_metadata(metadata)
-        for metadata in df.get_column("metadata").to_list()
+    parsed_values = {
+        target_column: [] for _, target_column in PARSED_METADATA_COLUMN_MAPPING
+    }
+    for metadata in df.get_column("metadata"):
+        parsed_row = parse_ica_cost_metadata(metadata)
+        for source_column, target_column in PARSED_METADATA_COLUMN_MAPPING:
+            value = parsed_row[source_column]
+            if source_column == "id_matches_reference" and value is not None:
+                value = str(value).lower()
+            parsed_values[target_column].append(value)
+
+    parsed_columns = [
+        pl.Series(target_column, parsed_values[target_column], dtype=pl.String)
+        for _, target_column in PARSED_METADATA_COLUMN_MAPPING
     ]
-    parsed_columns = []
-    for source_column, target_column in PARSED_METADATA_COLUMN_MAPPING:
-        values = [row[source_column] for row in parsed_metadata]
-        if source_column == "id_matches_reference":
-            values = [None if value is None else str(value).lower() for value in values]
-        parsed_columns.append(pl.Series(target_column, values, dtype=pl.String))
 
     df = df.hstack(parsed_columns).select(list(OUTPUT_COLUMNS))
 
