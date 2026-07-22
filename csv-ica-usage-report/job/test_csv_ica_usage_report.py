@@ -29,7 +29,8 @@ def test_normalise_column_name():
     assert job.normalise_column_name("__UNNAMED__: 1") == "unnamed_1"
 
 
-def test_parse_bool_supports_safe_load_default():
+def test_parse_bool_supports_dry_run_default():
+    assert job.parse_bool(None) is False
     assert job.parse_bool(None, default=False) is False
     assert job.parse_bool("true", default=False) is True
     assert job.parse_bool("false", default=True) is False
@@ -138,6 +139,8 @@ def test_load_sql_truncates_and_reloads_target_without_safety_tables():
 
     assert "__staging" not in init_sql
     assert "__previous" not in init_sql
+    assert "DROP TABLE IF EXISTS orcavault.tsa.csv__ica_usage_report;" in init_sql
+    assert "CREATE TABLE IF NOT EXISTS orcavault.tsa.csv__ica_usage_report" in init_sql
     assert "__staging" not in load_sql
     assert "__previous" not in load_sql
     assert "DELETE FROM" not in load_sql.upper()

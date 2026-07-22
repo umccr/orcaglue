@@ -145,7 +145,7 @@ def resolve_output_paths(base_name: str) -> tuple[str, str, str]:
     return out_name, out_name_dot, out_path
 
 
-def parse_bool(value: str | bool | None, default: bool = True) -> bool:
+def parse_bool(value: str | bool | None, default: bool = False) -> bool:
     if value is None:
         return default
     if isinstance(value, bool):
@@ -208,7 +208,8 @@ def create_table_sql(name: str) -> str:
 
 
 def init_sql() -> str:
-    return create_table_sql(table_name(include_database=True))
+    target_table = table_name(include_database=True)
+    return f"DROP TABLE IF EXISTS {target_table};\n\n{create_table_sql(target_table)}"
 
 
 def build_target_load_sql(s3_csv_uri: str, role: str) -> list[str]:
@@ -534,8 +535,8 @@ class GlueIcaUsageReport(GlueJobBase):
             params.append("s3_mid_path")
         if "--source_prefix" in sys.argv:
             params.append("source_prefix")
-        if "--load_enabled" in sys.argv:
-            params.append("load_enabled")
+        if "--dry_run" in sys.argv:
+            params.append("dry_run")
 
         args = getResolvedOptions(sys.argv, params)
 
@@ -543,7 +544,7 @@ class GlueIcaUsageReport(GlueJobBase):
         self.workgroup = args["rs_workgroup"]
         self.role = args["rs_role"]
         self.source_prefix = args.get("source_prefix", S3_SOURCE_PREFIX_DEFAULT)
-        self.load_enabled = parse_bool(args.get("load_enabled"), default=False)
+        self.dry_run = parse_bool(args.get("dry_run"))
 
         job_name = args.get("JOB_NAME", "GlueIcaUsageReport")
         self.init(job_name, args)
@@ -560,16 +561,16 @@ class GlueIcaUsageReport(GlueJobBase):
         downloaded = extract(self.bucket, self.source_prefix)
         result = transform(downloaded)
 
-        if self.load_enabled:
+        if self.dry_run:
+            upload_artifacts(self.bucket, result)
+            print("Dry run enabled: skipping Redshift load")
+        else:
             load(
                 bucket=self.bucket,
                 workgroup=self.workgroup,
                 role=self.role,
                 result=result,
             )
-        else:
-            upload_artifacts(self.bucket, result)
-            print("Skipping Redshift load because load_enabled=false")
 
         clean_up()
         self.commit()

@@ -115,7 +115,7 @@ glue_job = aws.glue.Job(
             "--base_name": base_name,
             "--s3_mid_path": s3_mid_path,
             "--source_prefix": source_prefix,
-            "--load_enabled": "false",
+            "--dry_run": "false",
         }
     ),
 )
@@ -144,9 +144,6 @@ glue_trigger = aws.glue.Trigger(
     actions=[
         aws.glue.TriggerActionArgs(
             job_name=glue_job.name,
-            arguments={
-                "--load_enabled": "true",
-            },
         )
     ],
 )
