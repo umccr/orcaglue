@@ -32,10 +32,18 @@ def parse_ica_cost_metadata(metadata: str | None) -> dict[str, str | bool | None
 
     if metadata is not None:
         for pair in metadata.split("|"):
-            separator = pair.find(":")
-            key = pair.split(":", 1)[0]
-            value = pair[separator + 1 :]
-            data[key] = value if value != "" else None
+            if not pair:
+                continue
+
+            if ":" in pair:
+                key, value = pair.split(":", 1)
+            else:
+                key, value = pair, None
+
+            if not key:
+                continue
+
+            data[key] = value if value else None
 
     reference_exists = "reference" in data
     reference = data.get("reference")

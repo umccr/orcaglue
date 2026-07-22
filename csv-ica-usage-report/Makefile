@@ -5,10 +5,11 @@ install:
 
 # targets inside Docker container
 
-.PHONY: install cwd run run-dry
+.PHONY: install cwd run run-dry test
 
 include ../local.mk
 
+PYTHON ?= python
 dry_run ?= false
 source_prefix ?= ica-usage-reports/
 
@@ -26,3 +27,6 @@ run: debug cwd
 		--rs_role "arn:aws:iam::115253169271:role/dev-redshift-namespace-role" \
 		--source_prefix "$(source_prefix)" \
 		--dry_run "$(dry_run)"
+
+test:
+	$(PYTHON) -m pytest -q job/test_*.py

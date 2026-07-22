@@ -63,3 +63,13 @@ def test_parse_preserves_legacy_pair_handling():
     assert result["license"] == "second"
     assert result["ref_format"] == "unknown"
     assert result["id_matches_reference"] is None
+
+
+def test_parse_key_only_and_empty_segments():
+    result = parse_ica_cost_metadata("status|reference|license:||:ignored|")
+
+    assert result["status"] is None
+    assert result["license"] is None
+    assert result["ref_format"] == "unknown"
+    assert result["reference_raw"] is None
+    assert result["ref_uuid"] is None

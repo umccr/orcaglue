@@ -209,8 +209,10 @@ make run-dry
 Run the focused unit tests from the module root in the Conda environment:
 
 ```bash
-python -m pytest -q job/test_*.py
+make test
 ```
+
+Override the interpreter when needed with `make test PYTHON=/path/to/python`.
 
 ## Destroy
 
