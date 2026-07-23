@@ -14,14 +14,14 @@ dry_run ?= false
 source_prefix ?= ica-usage-reports/
 
 cwd:
-	cd /home/hadoop/workspace/csv-ica-usage-report
+	cd /home/hadoop/workspace/spreadsheet-ica-usage-report
 
 run-dry: dry_run = true
 run-dry: run
 
 run: debug cwd
 	spark-submit \
-		job/csv_ica_usage_report.py \
+		job/spreadsheet_ica_usage_report.py \
 		--lz_bucket "orcahouse-dev-landing-zone-115253169271-ap-southeast-2-an" \
 		--rs_workgroup "orcahouse-dev" \
 		--rs_role "arn:aws:iam::115253169271:role/dev-redshift-namespace-role" \

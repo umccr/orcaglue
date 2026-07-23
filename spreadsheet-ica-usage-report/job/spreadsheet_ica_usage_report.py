@@ -54,7 +54,7 @@ except ModuleNotFoundError:  # pragma: no cover - lets unit tests import helpers
     SparkSession = None
 
 
-BASE_NAME_DEFAULT = "csv__ica_usage_report"
+BASE_NAME_DEFAULT = "spreadsheet__ica_usage_report"
 S3_MID_PATH_DEFAULT = f"orcaglue/{BASE_NAME_DEFAULT}/dev"
 S3_SOURCE_PREFIX_DEFAULT = "ica-usage-reports/"
 SCHEMA_NAME = "tsa"

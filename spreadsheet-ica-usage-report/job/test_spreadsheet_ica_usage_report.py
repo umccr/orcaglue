@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-import csv_ica_usage_report as job
+import spreadsheet_ica_usage_report as job
 
 
 def write_csv(path: Path, content: str) -> None:
@@ -41,7 +41,7 @@ def test_transform_combines_files_and_writes_expected_columns(tmp_path, monkeypa
     monkeypatch.setattr(
         job,
         "OUT_PATH",
-        str(tmp_path / "orcavault_tsa_csv__ica_usage_report"),
+        str(tmp_path / "orcavault_tsa_spreadsheet__ica_usage_report"),
     )
 
     first = tmp_path / "first.csv"
@@ -100,7 +100,7 @@ def test_transform_combines_files_and_writes_expected_columns(tmp_path, monkeypa
     assert output[1]["ref_format"] == "no_reference"
 
     manifest = json.loads(Path(result.manifest_file).read_text(encoding="utf-8"))
-    assert manifest["target_table"] == "orcavault.tsa.csv__ica_usage_report"
+    assert manifest["target_table"] == "orcavault.tsa.spreadsheet__ica_usage_report"
     assert manifest["expected_columns"] == list(job.OUTPUT_COLUMNS)
     assert "staging_table" not in manifest
     assert "previous_table" not in manifest
@@ -110,7 +110,7 @@ def test_transform_rejects_schema_drift(tmp_path, monkeypatch):
     monkeypatch.setattr(
         job,
         "OUT_PATH",
-        str(tmp_path / "orcavault_tsa_csv__ica_usage_report"),
+        str(tmp_path / "orcavault_tsa_spreadsheet__ica_usage_report"),
     )
 
     source = tmp_path / "drift.csv"
@@ -132,20 +132,25 @@ def test_load_sql_truncates_and_reloads_target_without_safety_tables():
     init_sql = job.init_sql()
     load_sql = "\n".join(
         job.build_target_load_sql(
-            "s3://example-bucket/orcaglue/csv__ica_usage_report/dev/report.csv",
+            "s3://example-bucket/orcaglue/spreadsheet__ica_usage_report/dev/report.csv",
             "arn:aws:iam::115253169271:role/dev-redshift-namespace-role",
         )
     )
 
     assert "__staging" not in init_sql
     assert "__previous" not in init_sql
-    assert "DROP TABLE IF EXISTS orcavault.tsa.csv__ica_usage_report;" in init_sql
-    assert "CREATE TABLE IF NOT EXISTS orcavault.tsa.csv__ica_usage_report" in init_sql
+    assert (
+        "DROP TABLE IF EXISTS orcavault.tsa.spreadsheet__ica_usage_report;" in init_sql
+    )
+    assert (
+        "CREATE TABLE IF NOT EXISTS "
+        "orcavault.tsa.spreadsheet__ica_usage_report" in init_sql
+    )
     assert "__staging" not in load_sql
     assert "__previous" not in load_sql
     assert "DELETE FROM" not in load_sql.upper()
-    assert "TRUNCATE TABLE tsa.csv__ica_usage_report" in load_sql
-    assert "COPY tsa.csv__ica_usage_report" in load_sql
+    assert "TRUNCATE TABLE tsa.spreadsheet__ica_usage_report" in load_sql
+    assert "COPY tsa.spreadsheet__ica_usage_report" in load_sql
     assert '"ica_execution_id"' in load_sql
     assert '"id_matches_reference"' in load_sql
 
@@ -169,13 +174,15 @@ def test_load_to_redshift_uses_existing_shared_infra_permissions(monkeypatch):
     job.load_to_redshift(
         workgroup="orcahouse-dev",
         role="arn:aws:iam::115253169271:role/dev-redshift-namespace-role",
-        csv_s3_uri="s3://example-bucket/orcaglue/csv__ica_usage_report/dev/report.csv",
+        csv_s3_uri=(
+            "s3://example-bucket/orcaglue/spreadsheet__ica_usage_report/dev/report.csv"
+        ),
         expected_rows=2,
     )
 
     assert len(client.sqls) == 3
-    assert client.sqls[0] == "TRUNCATE TABLE tsa.csv__ica_usage_report;"
-    assert "COPY tsa.csv__ica_usage_report" in client.sqls[1]
+    assert client.sqls[0] == "TRUNCATE TABLE tsa.spreadsheet__ica_usage_report;"
+    assert "COPY tsa.spreadsheet__ica_usage_report" in client.sqls[1]
     assert "SELECT COUNT(*)" in client.sqls[2]
 
 

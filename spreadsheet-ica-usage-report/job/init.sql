@@ -3,7 +3,7 @@
 --
 -- README:
 --   Paste this script into Redshift Query Editor and run it before the first
---   csv_ica_usage_report Glue load.
+--   spreadsheet_ica_usage_report Glue load.
 --
 --   This migration intentionally creates only the TSA target table. The Glue
 --   job refreshes the current TSA snapshot with TRUNCATE AND RELOAD; historical
@@ -13,9 +13,9 @@
 --   matches the current Glue output columns.
 --
 
-DROP TABLE IF EXISTS orcavault.tsa.csv__ica_usage_report;
+DROP TABLE IF EXISTS orcavault.tsa.spreadsheet__ica_usage_report;
 
-CREATE TABLE IF NOT EXISTS orcavault.tsa.csv__ica_usage_report
+CREATE TABLE IF NOT EXISTS orcavault.tsa.spreadsheet__ica_usage_report
 (
     usage_id                     varchar(65535),
     uc_name                      varchar(65535),
@@ -53,4 +53,4 @@ CREATE TABLE IF NOT EXISTS orcavault.tsa.csv__ica_usage_report
 );
 
 SELECT
-    'csv__ica_usage_report table ready' AS status;
+    'spreadsheet__ica_usage_report table ready' AS status;

@@ -35,11 +35,11 @@ landing_zone_bucket = aws.s3.get_bucket(bucket=lz_bucket)
 
 # --- S3 Uploads ---
 
-job_name = "csv-ica-usage-report"
+job_name = "spreadsheet-ica-usage-report"
 
 # NOTE: this is intended db table naming convention
 # i.e. <datasource>__<suffix_meaningful_naming_convention>
-base_name = "csv__ica_usage_report"
+base_name = "spreadsheet__ica_usage_report"
 s3_mid_path = f"{stack_prefix}/{base_name}/{stack_stage}"
 
 
