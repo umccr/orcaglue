@@ -13,6 +13,8 @@ from typing import Any
 
 import polars as pl
 
+from ica_cost_metadata import parse_ica_cost_metadata
+
 try:
     import boto3
 except ModuleNotFoundError:  # pragma: no cover
@@ -84,6 +86,25 @@ EXPECTED_COLUMNS = (
     "billing_date",
 )
 
+PARSED_METADATA_COLUMN_MAPPING = (
+    ("id", "ica_execution_id"),
+    ("license", "license"),
+    ("pipeline_uuid", "pipeline_uuid"),
+    ("status", "status"),
+    ("domain", "domain"),
+    ("type", "type"),
+    ("workflow_name", "workflow_name"),
+    ("workflow_version", "workflow_version"),
+    ("portal_run_id", "portal_run_id"),
+    ("ref_format", "ref_format"),
+    ("reference_raw", "reference_raw"),
+    ("ref_uuid", "ref_uuid"),
+    ("id_matches_reference", "id_matches_reference"),
+)
+OUTPUT_COLUMNS = EXPECTED_COLUMNS + tuple(
+    target for _, target in PARSED_METADATA_COLUMN_MAPPING
+)
+
 # Resolved at runtime in GlueIcaUsageReport constructor.
 BASE_NAME = BASE_NAME_DEFAULT
 S3_MID_PATH = S3_MID_PATH_DEFAULT
@@ -124,7 +145,7 @@ def resolve_output_paths(base_name: str) -> tuple[str, str, str]:
     return out_name, out_name_dot, out_path
 
 
-def parse_bool(value: str | bool | None, default: bool = True) -> bool:
+def parse_bool(value: str | bool | None, default: bool = False) -> bool:
     if value is None:
         return default
     if isinstance(value, bool):
@@ -173,12 +194,12 @@ def table_name(include_database: bool = False) -> str:
 
 
 def quoted_columns() -> str:
-    return ", ".join(f'"{column}"' for column in EXPECTED_COLUMNS)
+    return ", ".join(f'"{column}"' for column in OUTPUT_COLUMNS)
 
 
 def create_table_sql(name: str) -> str:
     columns = ",\n    ".join(
-        f"{column.ljust(28)} varchar(65535)" for column in EXPECTED_COLUMNS
+        f"{column.ljust(28)} varchar(65535)" for column in OUTPUT_COLUMNS
     )
     return f"""CREATE TABLE IF NOT EXISTS {name}
 (
@@ -187,7 +208,8 @@ def create_table_sql(name: str) -> str:
 
 
 def init_sql() -> str:
-    return create_table_sql(table_name(include_database=True))
+    target_table = table_name(include_database=True)
+    return f"DROP TABLE IF EXISTS {target_table};\n\n{create_table_sql(target_table)}"
 
 
 def build_target_load_sql(s3_csv_uri: str, role: str) -> list[str]:
@@ -307,6 +329,25 @@ def transform(downloaded: list[DownloadedObject]) -> TransformResult:
         print(item.local_path, df.columns, f"rows={df.height}")
 
     df = pl.concat(frames)
+
+    parsed_values = {
+        target_column: [] for _, target_column in PARSED_METADATA_COLUMN_MAPPING
+    }
+    for metadata in df.get_column("metadata"):
+        parsed_row = parse_ica_cost_metadata(metadata)
+        for source_column, target_column in PARSED_METADATA_COLUMN_MAPPING:
+            value = parsed_row[source_column]
+            if source_column == "id_matches_reference" and value is not None:
+                value = str(value).lower()
+            parsed_values[target_column].append(value)
+
+    parsed_columns = [
+        pl.Series(target_column, parsed_values[target_column], dtype=pl.String)
+        for _, target_column in PARSED_METADATA_COLUMN_MAPPING
+    ]
+
+    df = df.hstack(parsed_columns).select(list(OUTPUT_COLUMNS))
+
     duplicate_count = (
         0
         if df.is_empty()
@@ -334,7 +375,7 @@ def transform(downloaded: list[DownloadedObject]) -> TransformResult:
         "source_count": len(downloaded),
         "row_count": df.height,
         "duplicate_usage_billing_count": duplicate_count,
-        "expected_columns": list(EXPECTED_COLUMNS),
+        "expected_columns": list(OUTPUT_COLUMNS),
         "csv_sha256": sha256_file(csv_file),
     }
 
@@ -494,8 +535,8 @@ class GlueIcaUsageReport(GlueJobBase):
             params.append("s3_mid_path")
         if "--source_prefix" in sys.argv:
             params.append("source_prefix")
-        if "--load_enabled" in sys.argv:
-            params.append("load_enabled")
+        if "--dry_run" in sys.argv:
+            params.append("dry_run")
 
         args = getResolvedOptions(sys.argv, params)
 
@@ -503,7 +544,7 @@ class GlueIcaUsageReport(GlueJobBase):
         self.workgroup = args["rs_workgroup"]
         self.role = args["rs_role"]
         self.source_prefix = args.get("source_prefix", S3_SOURCE_PREFIX_DEFAULT)
-        self.load_enabled = parse_bool(args.get("load_enabled"), default=False)
+        self.dry_run = parse_bool(args.get("dry_run"))
 
         job_name = args.get("JOB_NAME", "GlueIcaUsageReport")
         self.init(job_name, args)
@@ -520,16 +561,16 @@ class GlueIcaUsageReport(GlueJobBase):
         downloaded = extract(self.bucket, self.source_prefix)
         result = transform(downloaded)
 
-        if self.load_enabled:
+        if self.dry_run:
+            upload_artifacts(self.bucket, result)
+            print("Dry run enabled: skipping Redshift load")
+        else:
             load(
                 bucket=self.bucket,
                 workgroup=self.workgroup,
                 role=self.role,
                 result=result,
             )
-        else:
-            upload_artifacts(self.bucket, result)
-            print("Skipping Redshift load because load_enabled=false")
 
         clean_up()
         self.commit()

@@ -9,9 +9,11 @@
 --   job refreshes the current TSA snapshot with TRUNCATE AND RELOAD; historical
 --   persistence is handled later in the PSA layer.
 --
---   No DROP statement is included here. If you need to rebuild this table,
---   take an explicit dependency check and run the DROP manually.
+--   This script drops and recreates the TSA table so the deployed schema
+--   matches the current Glue output columns.
 --
+
+DROP TABLE IF EXISTS orcavault.tsa.csv__ica_usage_report;
 
 CREATE TABLE IF NOT EXISTS orcavault.tsa.csv__ica_usage_report
 (
@@ -34,7 +36,20 @@ CREATE TABLE IF NOT EXISTS orcavault.tsa.csv__ica_usage_report
     usage_timestamp              varchar(65535),
     region                       varchar(65535),
     metadata                     varchar(65535),
-    billing_date                 varchar(65535)
+    billing_date                 varchar(65535),
+    ica_execution_id             varchar(65535),
+    license                      varchar(65535),
+    pipeline_uuid                varchar(65535),
+    status                       varchar(65535),
+    domain                       varchar(65535),
+    type                         varchar(65535),
+    workflow_name                varchar(65535),
+    workflow_version             varchar(65535),
+    portal_run_id                varchar(65535),
+    ref_format                   varchar(65535),
+    reference_raw                varchar(65535),
+    ref_uuid                     varchar(65535),
+    id_matches_reference         varchar(65535)
 );
 
 SELECT

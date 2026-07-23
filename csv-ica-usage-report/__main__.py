@@ -14,6 +14,7 @@ config = pulumi.Config()
 
 requirements = config.require("requirements")
 job_script = config.require("job-script")
+metadata_parser = "job/ica_cost_metadata.py"
 lz_bucket = config.require("lz-bucket")
 rs_workgroup = config.require("rs-workgroup")
 rs_role = config.require("rs-role")
@@ -69,6 +70,17 @@ job_script_s3 = aws.s3.BucketObject(
 
 pulumi.export("job_script_s3_key", job_script_s3.key)
 
+# Upload the job-local ICA metadata parser.
+metadata_parser_s3 = aws.s3.BucketObject(
+    "metadata-parser",
+    bucket=landing_zone_bucket.bucket,
+    key=f"{s3_mid_path}/{os.path.basename(metadata_parser)}",
+    source=pulumi.FileAsset(metadata_parser),
+    etag=file_md5(metadata_parser),
+)
+
+pulumi.export("metadata_parser_s3_key", metadata_parser_s3.key)
+
 # --- Glue Job ---
 
 glue_job = aws.glue.Job(
@@ -90,18 +102,20 @@ glue_job = aws.glue.Job(
     default_arguments=pulumi.Output.all(
         landing_zone_bucket.bucket,
         requirements_s3.key,
+        metadata_parser_s3.key,
     ).apply(
         lambda args: {
             "--job-language": "python",
             "--python-modules-installer-option": "-r",
             "--additional-python-modules": f"s3://{args[0]}/{args[1]}",
+            "--extra-py-files": f"s3://{args[0]}/{args[2]}",
             "--lz_bucket": args[0],
             "--rs_workgroup": rs_workgroup,
             "--rs_role": rs_role,
             "--base_name": base_name,
             "--s3_mid_path": s3_mid_path,
             "--source_prefix": source_prefix,
-            "--load_enabled": "false",
+            "--dry_run": "false",
         }
     ),
 )
@@ -130,9 +144,6 @@ glue_trigger = aws.glue.Trigger(
     actions=[
         aws.glue.TriggerActionArgs(
             job_name=glue_job.name,
-            arguments={
-                "--load_enabled": "true",
-            },
         )
     ],
 )
