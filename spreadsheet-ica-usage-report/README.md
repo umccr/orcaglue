@@ -6,6 +6,7 @@
   - [What This Job Does](#what-this-job-does)
     - [Load and Validation Flow](#load-and-validation-flow)
   - [Deployment](#deployment)
+    - [Development Prerequisites](#development-prerequisites)
   - [Redshift Table Setup](#redshift-table-setup)
   - [Glue Job Run](#glue-job-run)
   - [Local Development](#local-development)
@@ -68,6 +69,26 @@ Row-count checks validate snapshot completeness, not field-level business meanin
 
 ## Deployment
 
+### Development Prerequisites
+
+Before deploying, create a Python virtual environment using any method and install the development toolchain [requirements](../requirements-dev.txt).
+
+See [README_DEV.md](../README_DEV.md) for the Python version requirement and more comprehensive setup details.
+
+> For the first-time setup, run the following from the repository root:
+>
+> ```bash
+> conda activate orcaglue
+> make install
+> make check
+> ```
+
+If the environment and dependencies were installed previously, only activate the environment:
+
+```bash
+conda activate orcaglue
+```
+
 We use Pulumi to orchestrate deployment of the ETL.
 
 Authenticate an AWS session with administrator access:
@@ -94,22 +115,23 @@ pulumi login s3://pulumi-state-115253169271-ap-southeast-2-an/orcaglue
 > cd ..
 > ```
 >
-> Change to the module root:
+> And, then change back to the to the module root:
+>
+> ```bash
+> cd spreadsheet-ica-usage-report
+> ```
 
-```bash
-cd spreadsheet-ica-usage-report
-```
+> **Notice — existing deployments only:** Preserve the Pulumi stack state and history by renaming the project in the existing stack. Do not initialise a second stack under the new project name.
+>
+> ```bash
+> pulumi stack rename organization/spreadsheet-ica-usage-report/dev \
+>   --stack organization/csv-ica-usage-report/dev
+> pulumi stack select organization/spreadsheet-ica-usage-report/dev
+> ```
+>
+> This is a one-time manual cutover action. Run it before the first preview from the renamed project.
 
-For an existing deployment, preserve the Pulumi stack state and history by renaming the project in the existing stack. Do not initialise a second stack under the new project name:
-
-```bash
-pulumi stack rename organization/spreadsheet-ica-usage-report/dev \
-  --stack organization/csv-ica-usage-report/dev
-pulumi stack select organization/spreadsheet-ica-usage-report/dev
-```
-
-This is a one-time manual cutover action. Run it before the first preview from
-the renamed project. If the stack has never been created, initialise it instead:
+If the stack has never been created, initialise it:
 
 ```bash
 pulumi stack init dev --secrets-provider="awskms://alias/pulumi-state-key"
@@ -132,11 +154,38 @@ A prod stack configuration is intentionally not included because the prod worksp
 
 ## Redshift Table Setup
 
-Run [job/init.sql](job/init.sql) in Redshift Query Editor before the first load. Confirm the deployment notice before running the load.
+Run [job/init.sql](job/init.sql) in Redshift Query Editor before the first load.
+
+> **Important:** Run this SQL as the warehouse **poweruser** role, not the administrator user. The administrator user is reserved for building IAM roles and infrastructure.
 
 The script uses `DROP TABLE IF EXISTS` followed by `CREATE TABLE` so an existing TSA table is recreated with the current metadata columns. Running it deletes any data currently stored in `tsa.spreadsheet__ica_usage_report`; **do not run it while the Glue job or downstream transformations are active**.
 
 The legacy `tsa.csv__ica_usage_report` table is not removed by this script. Keep it until the renamed job is validated and downstream consumers have been switched.
+
+> **Notice — refresh the Glue role grants:** If you rename the table or physically drop and recreate it in Redshift Query Editor, refresh the shared Glue execution role grants before the next Glue job run. See [Refresh Grant Glue Role](../shared-infra/README.md#refresh-grant-glue-role) in the shared infrastructure documentation.
+>
+> From the repository root, select the `shared-infra` stack and refresh the grant statement. This operation is idempotent:
+>
+> ```bash
+> cd shared-infra
+> pulumi stack select dev
+> pulumi up --replace 'urn:pulumi:dev::shared-infra::aws:redshiftdata/statement:Statement::orcaglue-shared-infra-glue-role-tsa-grants-dev'
+> ```
+>
+> Alternatively, run the following directly in Redshift Query Editor as the warehouse power user:
+>
+> ```sql
+> GRANT USAGE ON SCHEMA tsa TO "IAMR:orcaglue-shared-infra-glue-job-role-dev";
+>
+> GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE
+> ON ALL TABLES IN SCHEMA tsa
+> TO "IAMR:orcaglue-shared-infra-glue-job-role-dev";
+>
+> ALTER DEFAULT PRIVILEGES IN SCHEMA tsa
+> GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE
+> ON TABLES
+> TO "IAMR:orcaglue-shared-infra-glue-job-role-dev";
+> ```
 
 ## Glue Job Run
 
