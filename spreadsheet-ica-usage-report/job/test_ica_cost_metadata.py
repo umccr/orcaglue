@@ -27,6 +27,8 @@ def test_parse_structured_workflow_reference():
         "reference_raw": None,
         "ref_uuid": ICA_EXECUTION_ID,
         "id_matches_reference": True,
+        "ica_v2": None,
+        "is_in_grace_period": None,
     }
 
 
@@ -73,3 +75,13 @@ def test_parse_key_only_and_empty_segments():
     assert result["ref_format"] == "unknown"
     assert result["reference_raw"] is None
     assert result["ref_uuid"] is None
+
+
+def test_parse_bioinsight_storage_metadata():
+    """Storage rows carry these two keys from the 2026-05 reports onwards."""
+    result = parse_ica_cost_metadata("ica_v2:true|is_in_grace_period:false")
+
+    assert result["ica_v2"] == "true"
+    assert result["is_in_grace_period"] == "false"
+    assert result["ref_format"] == "no_reference"
+    assert result["id"] is None

@@ -63,7 +63,21 @@ REGION_NAME = "ap-southeast-2"
 REDSHIFT_STATEMENT_TIMEOUT_SECONDS = 10 * 60
 REDSHIFT_POLL_INTERVAL_SECONDS = 2
 
-EXPECTED_COLUMNS = (
+# Illumina replaced the ICA Usage Explorer with the BioInsight Core one from the
+# 2026-05 report onwards. The two source layouts below are both accepted and are
+# stored side by side, so the TSA table stays a faithful mirror of the source and
+# the PSA/dbt layer decides how to reconcile them.
+#
+# Legacy (2026-04 and earlier)   BioInsight Core (2026-05 onwards)
+# ----------------------------   ---------------------------------
+# (none)                         row_seq            new, always 1 so far
+# price_per_unit                 list_rate          renamed, identical values
+# (none)                         applied_rate       new, rate after discounts
+# (none)                         pricing_method     new, "Standard Rate" so far
+# (none)                         cost_saved         new, quantity * (list - applied)
+# cost                           cost               now exactly quantity * applied_rate
+# cost_unit "iCredits"           cost_unit "BIC"    renamed 1:1, values unchanged
+LEGACY_SOURCE_COLUMNS = (
     "usage_id",
     "uc_name",
     "billable_account_id",
@@ -86,6 +100,72 @@ EXPECTED_COLUMNS = (
     "billing_date",
 )
 
+BIOINSIGHT_SOURCE_COLUMNS = (
+    "usage_id",
+    "row_seq",
+    "uc_name",
+    "billable_account_id",
+    "account_name",
+    "account_type",
+    "usage_context",
+    "usage_context_type",
+    "user_name",
+    "product",
+    "usage_type_description",
+    "quantity",
+    "usage_unit",
+    "category",
+    "usage_timestamp",
+    "region",
+    "metadata",
+    "billing_date",
+    "cost_unit",
+    "pricing_method",
+    "list_rate",
+    "applied_rate",
+    "cost",
+    "cost_saved",
+)
+
+# Columns only ever written by one of the two layouts. Used to label each source
+# file in the manifest; a file carrying neither is reported as "unknown".
+LEGACY_ONLY_COLUMNS = frozenset(LEGACY_SOURCE_COLUMNS) - frozenset(
+    BIOINSIGHT_SOURCE_COLUMNS
+)
+BIOINSIGHT_ONLY_COLUMNS = frozenset(BIOINSIGHT_SOURCE_COLUMNS) - frozenset(
+    LEGACY_SOURCE_COLUMNS
+)
+
+# The union of both layouts, in BioInsight Core order, with the legacy
+# price_per_unit kept next to the list_rate that superseded it.
+EXPECTED_COLUMNS = (
+    "usage_id",
+    "row_seq",
+    "uc_name",
+    "billable_account_id",
+    "account_name",
+    "account_type",
+    "usage_context",
+    "usage_context_type",
+    "user_name",
+    "product",
+    "usage_type_description",
+    "quantity",
+    "usage_unit",
+    "category",
+    "usage_timestamp",
+    "region",
+    "metadata",
+    "billing_date",
+    "cost_unit",
+    "pricing_method",
+    "price_per_unit",
+    "list_rate",
+    "applied_rate",
+    "cost",
+    "cost_saved",
+)
+
 PARSED_METADATA_COLUMN_MAPPING = (
     ("id", "ica_execution_id"),
     ("license", "license"),
@@ -100,6 +180,8 @@ PARSED_METADATA_COLUMN_MAPPING = (
     ("reference_raw", "reference_raw"),
     ("ref_uuid", "ref_uuid"),
     ("id_matches_reference", "id_matches_reference"),
+    ("ica_v2", "ica_v2"),
+    ("is_in_grace_period", "is_in_grace_period"),
 )
 OUTPUT_COLUMNS = EXPECTED_COLUMNS + tuple(
     target for _, target in PARSED_METADATA_COLUMN_MAPPING
@@ -136,6 +218,7 @@ class TransformResult:
     row_count: int
     duplicate_usage_billing_count: int
     source_count: int
+    source_layouts: dict[str, int]
 
 
 def resolve_output_paths(base_name: str) -> tuple[str, str, str]:
@@ -174,6 +257,25 @@ def get_s3_client():
 def normalise_column_name(name: str) -> str:
     normalised = re.sub(r"[^a-z0-9]+", "_", name.strip().lower())
     return re.sub(r"_+", "_", normalised).strip("_")
+
+
+def detect_source_layout(columns: list[str]) -> str:
+    """Label a source file as the legacy or the BioInsight Core usage export.
+
+    Detection is for the audit manifest only and never rejects a file. Columns a
+    layout does not carry are null-filled, so a partial export still loads.
+    """
+    present = frozenset(columns)
+    legacy = bool(present & LEGACY_ONLY_COLUMNS)
+    bioinsight = bool(present & BIOINSIGHT_ONLY_COLUMNS)
+
+    if legacy and bioinsight:
+        return "mixed"
+    if bioinsight:
+        return "bioinsight"
+    if legacy:
+        return "legacy"
+    return "unknown"
 
 
 def sql_literal(value: str) -> str:
@@ -291,7 +393,7 @@ def _drop_helper_columns(df: pl.DataFrame) -> pl.DataFrame:
     return df.drop(helper_columns) if helper_columns else df
 
 
-def _read_source_csv(path: str) -> pl.DataFrame:
+def _read_source_csv(path: str) -> tuple[pl.DataFrame, str]:
     df = pl.read_csv(path, infer_schema_length=False, infer_schema=False)
     df.columns = [normalise_column_name(column) for column in df.columns]
     df = _drop_helper_columns(df)
@@ -302,6 +404,8 @@ def _read_source_csv(path: str) -> pl.DataFrame:
             f"Unexpected columns in {path}: {', '.join(extra_columns)}. "
             "Update the TSA table and EXPECTED_COLUMNS before loading this report."
         )
+
+    layout = detect_source_layout(df.columns)
 
     for column in EXPECTED_COLUMNS:
         if column not in df.columns:
@@ -315,7 +419,7 @@ def _read_source_csv(path: str) -> pl.DataFrame:
         .otherwise(pl.col(pl.String))
         .name.keep()
     )
-    return df.filter(~pl.all_horizontal(pl.all().is_null()))
+    return df.filter(~pl.all_horizontal(pl.all().is_null())), layout
 
 
 def transform(downloaded: list[DownloadedObject]) -> TransformResult:
@@ -323,10 +427,12 @@ def transform(downloaded: list[DownloadedObject]) -> TransformResult:
         raise RuntimeError("No downloaded CSV files to transform")
 
     frames = []
+    source_layouts: dict[str, int] = {}
     for item in downloaded:
-        df = _read_source_csv(item.local_path)
+        df, layout = _read_source_csv(item.local_path)
         frames.append(df)
-        print(item.local_path, df.columns, f"rows={df.height}")
+        source_layouts[layout] = source_layouts.get(layout, 0) + 1
+        print(item.local_path, f"layout={layout}", f"rows={df.height}")
 
     df = pl.concat(frames)
 
@@ -375,6 +481,7 @@ def transform(downloaded: list[DownloadedObject]) -> TransformResult:
         "source_count": len(downloaded),
         "row_count": df.height,
         "duplicate_usage_billing_count": duplicate_count,
+        "source_layouts": source_layouts,
         "expected_columns": list(OUTPUT_COLUMNS),
         "csv_sha256": sha256_file(csv_file),
     }
@@ -393,6 +500,7 @@ def transform(downloaded: list[DownloadedObject]) -> TransformResult:
         row_count=df.height,
         duplicate_usage_billing_count=duplicate_count,
         source_count=len(downloaded),
+        source_layouts=source_layouts,
     )
 
 

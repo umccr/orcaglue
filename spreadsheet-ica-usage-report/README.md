@@ -4,6 +4,7 @@
 
 - [ICA Usage Report Spreadsheet](#ica-usage-report-spreadsheet)
   - [What This Job Does](#what-this-job-does)
+    - [Source Report Layouts](#source-report-layouts)
     - [Load and Validation Flow](#load-and-validation-flow)
   - [Deployment](#deployment)
     - [Development Prerequisites](#development-prerequisites)
@@ -24,6 +25,7 @@ The job:
 
 - Reads every CSV file under the configured `ica-usage-reports/` source prefix.
 - Treats the source columns as strings and normalises the known column names.
+- Accepts both Illumina usage export layouts, the legacy one and the BioInsight Core one.
 - Trims whitespace and removes fully empty rows.
 - Parses the ICA `metadata` column using the OrcaVault metadata contract.
 - Writes a consolidated CSV, generated SQL schema and JSON audit manifest.
@@ -54,6 +56,26 @@ Raw source reports belong under `ica-usage-reports/` at the bucket root. The `or
 The published TSA table is
 `orcavault.tsa.spreadsheet__ica_usage_report`.
 
+### Source Report Layouts
+
+Illumina replaced the ICA Usage Explorer with the [BioInsight Core Usage Explorer](https://help.connected.illumina.com/account-management/usage-explorer). The export changed shape from the **2026-05** report onwards, so the source prefix now holds two layouts at once. The job reads both and stores their columns side by side, leaving the TSA table a faithful mirror of the source. Reconciling the two eras belongs in the PSA/dbt layer, not here.
+
+| Legacy, 2026-04 and earlier | BioInsight Core, 2026-05 onwards | Note |
+| --- | --- | --- |
+| — | `row_seq` | New. Always `1` in every report seen so far. |
+| `price_per_unit` | `list_rate` | Renamed. Values are identical, so the two are directly comparable. |
+| — | `applied_rate` | New. The rate actually charged, after any discount. A storage discount of roughly 1.6% starts at the cutover; the effective storage rate drops from ~22.43 to ~22.01, so this is a real pricing change and not only a schema one. |
+| — | `pricing_method` | New. Illumina documents this as *Pricing Mechanism*. Always `Standard Rate` so far. |
+| — | `cost_saved` | New. Equals `quantity * (list_rate - applied_rate)`. Non-zero on `Standard Storage` rows only, roughly 22-23 BIC per month so far. |
+| `cost` | `cost` | Now exactly `quantity * applied_rate`, and `quantity * list_rate - cost` reproduces `cost_saved` exactly. Under the legacy layout `quantity * price_per_unit` reproduced `cost` only to rounding (off by at most 0.005 in either direction), because no discount was applied then. |
+| `cost_unit` is `iCredits` | `cost_unit` is `BIC` | Renamed to Illumina BioInsight Credits. `usage_unit` changed the same way. |
+
+Both column sets are declared in `job/spreadsheet_ica_usage_report.py` as `LEGACY_SOURCE_COLUMNS` and `BIOINSIGHT_SOURCE_COLUMNS`; `EXPECTED_COLUMNS` is their union and drives both the output CSV and `job/init.sql`. A column belonging to the other layout is written as `NULL`. Any column in neither set still fails the run, which is the intended signal that Illumina has changed the export again.
+
+> **Watch out — the `iCredits` to `BIC` rename.** Illumina [converted balances 1:1](https://help.connected.illumina.com/account-management/software-billing), so the numbers stay comparable across the cutover and no rescaling is applied. Both spellings are stored exactly as the source wrote them, which means **any downstream query filtering on the literal `'iCredits'` silently stops matching from 2026-05**. Match on both spellings, or coalesce them in PSA.
+
+Storage rows also began carrying `ica_v2` and `is_in_grace_period` in their `metadata` from 2026-05. Both are parsed out into their own columns; `is_in_grace_period` is what explains zero-cost storage rows.
+
 ### Load and Validation Flow
 
 This TSA job publishes the current snapshot only. The change history is expected to be persisted in the PSA layer.
@@ -63,9 +85,13 @@ The job publishes one complete snapshot per run:
 1. Transform all source CSV files into one normalised CSV, reject unexpected columns and upload the CSV, SQL and manifest artifacts.
 2. Refresh `orcavault.tsa.spreadsheet__ica_usage_report` directly with `TRUNCATE TABLE` and `COPY` statements through the Redshift Data API.
 3. Check the final target row count against the transformed CSV row count.
-4. Record source objects, SHA-256 checksums, row counts and duplicate `(usage_id, billing_date)` counts in the manifest.
+4. Record source objects, SHA-256 checksums, row counts, duplicate `(usage_id, billing_date)` counts and a per-layout file tally in the manifest.
 
 Row-count checks validate snapshot completeness, not field-level business meaning. The job records duplicate `(usage_id, billing_date)` values for audit only; it does not deduplicate rows.
+
+The manifest `source_layouts` field counts how many source files used each layout, for example `{"legacy": 13, "bioinsight": 3}`. A file that matches neither is counted as `unknown`, which is worth investigating even though it does not fail the run.
+
+> **Note on the duplicate key.** `(usage_id, billing_date)` is still unique in every report to date, including the BioInsight Core ones, because `row_seq` is always `1`. If Illumina ever emits `row_seq > 1` the grain becomes `(usage_id, row_seq, billing_date)` and this counter will start reporting those legitimate rows as duplicates. That is the intended alarm: it flags the grain change rather than hiding it.
 
 ## Deployment
 
@@ -158,7 +184,9 @@ Run [job/init.sql](job/init.sql) in Redshift Query Editor before the first load.
 
 > **Important:** Run this SQL as the warehouse **poweruser** role, not the administrator user. The administrator user is reserved for building IAM roles and infrastructure.
 
-The script uses `DROP TABLE IF EXISTS` followed by `CREATE TABLE` so an existing TSA table is recreated with the current metadata columns. Running it deletes any data currently stored in `tsa.spreadsheet__ica_usage_report`; **do not run it while the Glue job or downstream transformations are active**.
+The script uses `DROP TABLE IF EXISTS` followed by `CREATE TABLE` so an existing TSA table is recreated with the current metadata columns. It is generated from `EXPECTED_COLUMNS` and `PARSED_METADATA_COLUMN_MAPPING` in `job/spreadsheet_ica_usage_report.py`, and `test_init_sql_file_matches_generated_schema` fails if the two drift apart.
+
+> **Re-run required for the BioInsight Core columns.** The table now carries `row_seq`, `pricing_method`, `list_rate`, `applied_rate`, `cost_saved`, `ica_v2` and `is_in_grace_period` alongside the legacy `price_per_unit`. An existing deployment must re-run this script before the next Glue load, otherwise `COPY` fails on the unknown column list. Running it deletes any data currently stored in `tsa.spreadsheet__ica_usage_report`; **do not run it while the Glue job or downstream transformations are active**.
 
 The legacy `tsa.csv__ica_usage_report` table is not removed by this script. Keep it until the renamed job is validated and downstream consumers have been switched.
 
