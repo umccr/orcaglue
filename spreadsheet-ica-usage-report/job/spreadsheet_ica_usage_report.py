@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
-
 from ica_cost_metadata import parse_ica_cost_metadata
 
 try:
@@ -385,10 +384,7 @@ def _drop_helper_columns(df: pl.DataFrame) -> pl.DataFrame:
     helper_columns = [
         column
         for column in df.columns
-        if column == ""
-        or column.startswith("unnamed")
-        or column.startswith("duplicated")
-        or column.startswith("_duplicated")
+        if column == "" or column.startswith(("unnamed", "duplicated", "_duplicated"))
     ]
     return df.drop(helper_columns) if helper_columns else df
 

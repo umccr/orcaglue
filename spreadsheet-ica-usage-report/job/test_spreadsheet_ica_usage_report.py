@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 import spreadsheet_ica_usage_report as job
 
 
@@ -67,12 +66,7 @@ def test_transform_combines_files_and_writes_expected_columns(tmp_path, monkeypa
     )
     write_csv(
         second,
-        "\n".join(
-            [
-                "usage_id,billing_date,cost,metadata",
-                "u-2,2026-07-02,2.40,workflow id: wfr.2",
-            ]
-        ),
+        "usage_id,billing_date,cost,metadata\nu-2,2026-07-02,2.40,workflow id: wfr.2",
     )
 
     result = job.transform(
@@ -116,12 +110,7 @@ def test_transform_rejects_schema_drift(tmp_path, monkeypatch):
     source = tmp_path / "drift.csv"
     write_csv(
         source,
-        "\n".join(
-            [
-                "usage_id,billing_date,unexpected_column",
-                "u-1,2026-07-01,nope",
-            ]
-        ),
+        "usage_id,billing_date,unexpected_column\nu-1,2026-07-01,nope",
     )
 
     with pytest.raises(ValueError, match="Unexpected columns"):

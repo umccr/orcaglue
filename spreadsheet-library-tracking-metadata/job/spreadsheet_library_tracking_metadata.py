@@ -291,10 +291,10 @@ def load(bucket: str, workgroup: str, role: str):
 
     redshift_data_client = boto3.client("redshift-data", region_name=REGION_NAME)
 
-    common_kwargs = dict(
-        WorkgroupName=workgroup,
-        Database=DB_NAME,
-    )
+    common_kwargs = {
+        "WorkgroupName": workgroup,
+        "Database": DB_NAME,
+    }
 
     print(f"Truncating table: {table_name}")
     truncate_response = redshift_data_client.execute_statement(

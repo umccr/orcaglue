@@ -1,6 +1,5 @@
 from ica_cost_metadata import PARSED_METADATA_KEYS, parse_ica_cost_metadata
 
-
 ICA_EXECUTION_ID = "123e4567-e89b-12d3-a456-426614174000"
 PORTAL_RUN_ID = "20260720ABCDEF12"
 

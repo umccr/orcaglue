@@ -1,12 +1,11 @@
 import sys
 
 import pytest
+import sample
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 from pyspark.sql import SparkSession
-
-import sample
 
 
 @pytest.fixture(scope="module", autouse=True)

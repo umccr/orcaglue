@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 
-
 PARSED_METADATA_KEYS = (
     "id",
     "license",
