@@ -1,4 +1,6 @@
+import hashlib
 import os
+
 import pulumi
 import pulumi_aws as aws
 from orcaglue_shared_lib.tagging import register_global_tags
@@ -22,6 +24,13 @@ shared_glue_role_arn = shared_infra_ref.get_output("shared_glue_role_arn")
 
 pulumi.export("shared_glue_role_arn", shared_glue_role_arn)
 
+
+# Use the file checksum to detect S3 asset changes.
+def file_etag(path: str) -> str:
+    with open(path, "rb") as file_handle:
+        return hashlib.md5(file_handle.read()).hexdigest()
+
+
 # ---
 
 # Look up pre-existing S3 bucket
@@ -43,9 +52,7 @@ requirements_s3 = aws.s3.BucketObject(
     bucket=landing_zone_bucket.bucket,
     key=f"{s3_mid_path}/requirements.txt",
     source=pulumi.FileAsset(requirements),
-    etag=pulumi.Output.from_input(
-        open(os.path.abspath(requirements), "rb").read()
-    ).apply(lambda content: __import__("hashlib").md5(content).hexdigest()),
+    etag=file_etag(requirements),
 )
 
 pulumi.export("requirements_s3_key", requirements_s3.key)
@@ -56,9 +63,7 @@ job_script_s3 = aws.s3.BucketObject(
     bucket=landing_zone_bucket.bucket,
     key=f"{s3_mid_path}/{os.path.basename(job_script)}",
     source=pulumi.FileAsset(job_script),
-    etag=pulumi.Output.from_input(open(os.path.abspath(job_script), "rb").read()).apply(
-        lambda content: __import__("hashlib").md5(content).hexdigest()
-    ),
+    etag=file_etag(job_script),
 )
 
 pulumi.export("job_script_s3_key", job_script_s3.key)

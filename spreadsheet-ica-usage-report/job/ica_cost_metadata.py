@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 
-
 PARSED_METADATA_KEYS = (
     "id",
     "license",
@@ -17,6 +16,8 @@ PARSED_METADATA_KEYS = (
     "reference_raw",
     "ref_uuid",
     "id_matches_reference",
+    "ica_v2",
+    "is_in_grace_period",
 )
 
 STRUCTURED_REFERENCE_PATTERN = re.compile(
@@ -27,7 +28,12 @@ UUID_ONLY_REFERENCE_PATTERN = re.compile(r"^(.*)-([0-9a-fA-F-]{36})$")
 
 
 def parse_ica_cost_metadata(metadata: str | None) -> dict[str, str | bool | None]:
-    """Reproduce the legacy dbt ``parse_event`` macro for one metadata value."""
+    """Reproduce the legacy dbt ``parse_event`` macro for one metadata value.
+
+    ``ica_v2`` and ``is_in_grace_period`` are BioInsight Core additions that
+    appear on storage rows from the 2026-05 reports onwards. They are carried
+    through verbatim as the source already writes them as ``true``/``false``.
+    """
     data: dict[str, str | None] = {}
 
     if metadata is not None:
@@ -103,4 +109,6 @@ def parse_ica_cost_metadata(metadata: str | None) -> dict[str, str | bool | None
         "reference_raw": reference_raw,
         "ref_uuid": ref_uuid,
         "id_matches_reference": id_matches_reference,
+        "ica_v2": data.get("ica_v2"),
+        "is_in_grace_period": data.get("is_in_grace_period"),
     }
