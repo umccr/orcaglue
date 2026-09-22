@@ -3,7 +3,10 @@
 <!-- TOC -->
 * [Lab Library Tracking Metadata](#lab-library-tracking-metadata)
   * [Motivation](#motivation)
+  * [Configuration](#configuration)
   * [Deployment](#deployment)
+  * [Scheduled trigger in dev](#scheduled-trigger-in-dev)
+  * [Redshift Table Setup](#redshift-table-setup)
   * [Glue Job Run](#glue-job-run)
   * [Local Development](#local-development)
   * [History](#history)
@@ -24,87 +27,103 @@ We do this because --
 
 The strategy is not to solve with one-shot of a silver bullet. We are solving the data complexity challenge with multi-stage processing.
 
+## Configuration
+
+| | |
+|---|---|
+| Pulumi project | `spreadsheet-library-tracking-metadata` |
+| Glue job | `orcaglue-<stage>-spreadsheet-library-tracking-metadata-job` |
+| Job script | [job/spreadsheet_library_tracking_metadata.py](job/spreadsheet_library_tracking_metadata.py) |
+| Target table | `orcavault.tsa.spreadsheet__library_tracking_metadata` |
+| Source worksheets | one per year, `2017` through `2026` |
+| Schedule (prod) | `cron(25 13 * * ? *)` — 00:25 AEST/AEDT |
+
+The job reads one worksheet per year and concatenates them, adding the sheet name as a column. A
+new year means adding it to the `SHEETS` list in the job script.
+
+Datasource credentials are read at runtime from SSM Parameter Store. These parameters are **not**
+stage-scoped, so dev and prod read the same spreadsheet.
+
+* `/umccr/google/drive/lims_service_account_json`
+* `/umccr/google/drive/tracking_sheet_id`
+
+Stack config lives in [Pulumi.dev.yaml](Pulumi.dev.yaml) and [Pulumi.prod.yaml](Pulumi.prod.yaml).
+See [Stack Configuration](../README_DEPLOY.md#stack-configuration) for what each key means.
+
 ## Deployment
 
-We use Pulumi to orchestrate the deployment of the ETL. Do like so.
+Follow **[README_DEPLOY.md](../README_DEPLOY.md)**.
 
-Need authenticated AWS session.
-```
-export AWS_PROFILE=unimelb-warehouse-prod-admin
-aws sso login
-```
-_Required Admin privilege as it needs `iam:PassRole` permission. Ask Victor to apply the stack changes if you are not an admin._
+> **Before the first prod deployment:** steps 1-3 of the
+> [Deploy Process](../README_DEPLOY.md#deploy-process) must be done for `prod` — apply
+> `shared-infra`, run [job/init.sql](job/init.sql), then refresh the Glue role grants. The `tsa`
+> schema and the grants are owned by the `shared-infra` stack, not by this module.
 
-Login to Pulumi backend.
+The prod trigger ships disabled. Validate a manual run first, then see
+[Enable the scheduled trigger](../README_DEPLOY.md#enable-the-scheduled-trigger).
+
+## Scheduled trigger in dev
+
+Unlike the other ETL modules, this one also runs on a schedule in **dev**, daily at 13:10 UTC
+(00:10 AEST/AEDT). The trigger was originally armed out of band, so `trigger-enabled: "true"` is
+declared in [Pulumi.dev.yaml](Pulumi.dev.yaml) to keep the config honest about the live state.
+
+Confirm the actual state in AWS rather than trusting Pulumi state alone, because a trigger armed
+with `aws glue start-trigger` is invisible to `pulumi preview` without a refresh:
+
 ```
-pulumi login s3://pulumi-state-115253169271-ap-southeast-2-an/orcaglue
+aws glue get-trigger \
+  --name orcaglue-dev-spreadsheet-library-tracking-metadata-job-scheduled-trigger \
+  --query 'Trigger.State'
 ```
 
-Deploy the ETL.
-```
-pulumi stack
-pulumi stack --show-urns
-pulumi stack ls
-pulumi stack select dev
-pulumi preview
-pulumi up
-pulumi stack output
-```
+`CREATED` means disabled, `ACTIVATED` means live.
+
+## Redshift Table Setup
+
+Run [job/init.sql](job/init.sql) in Redshift Query Editor before the first load, as the warehouse
+**poweruser**.
+
+It is `DROP TABLE IF EXISTS` followed by `CREATE TABLE`, so re-running it deletes any data
+currently in `tsa.spreadsheet__library_tracking_metadata`. All columns are `varchar`.
+
+The `transform()` step regenerates this DDL from the dataframe. To refresh it, run the job with
+`--dry_run true` and copy the `CREATE TABLE` it prints.
+
+> After dropping and recreating the table, refresh the Glue role grants or the next job run will
+> fail with a permission error. See
+> [Refresh Grant Glue Role](../shared-infra/README.md#refresh-grant-glue-role).
 
 ## Glue Job Run
 
-See [README_GLUE_JOB.md](../README_GLUE_JOB.md)
+See [README_GLUE_JOB.md](../README_GLUE_JOB.md) for the general job run reference.
+
+```
+aws glue start-job-run --job-name orcaglue-dev-spreadsheet-library-tracking-metadata-job
+```
+
+The deployed job defaults to `--dry_run=false`. To transform and upload artefacts without
+touching Redshift:
+```
+aws glue start-job-run \
+  --job-name orcaglue-dev-spreadsheet-library-tracking-metadata-job \
+  --arguments '{"--dry_run":"true"}'
+```
 
 ## Local Development
 
-Read [README_LOCAL.md](../README_LOCAL.md)
+See [Run a Module](../README_LOCAL.md#run-a-module) for the local Glue container workflow, using
+`spreadsheet-library-tracking-metadata` as the module.
 
-And do like so.
-
-Authenticate AWS session.
-```
-export AWS_PROFILE=unimelb-warehouse-prod-poweruser
-aws sso login
-```
-
-Using `granted` CLI to export AWS env vars.
-```
-assume
-env | grep AWS
-```
-
-Change the directory to the module root.
 ```
 cd spreadsheet-library-tracking-metadata
-```
-
-Bring up the local glue stack.
-```
 make up
-make ps
-```
-
-Enter into the glue instance.
-```
 make glue
-```
-
-Go to the module root inside the container as well.
-```
+# inside the container
 cd workspace/spreadsheet-library-tracking-metadata/
-```
-
-Run the diagnostics target to check your AWS credentials.
-```
 make debug
+make run        # or: make run-dry
 ```
-
-Run the ETL script.
-```
-make run
-```
-
-_Optionally you may temporarily comment out the `load()` function inside `GlueLibraryTrackingMetadata.run()` to avoid the data loading._
 
 ## History
 

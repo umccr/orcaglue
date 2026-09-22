@@ -9,3 +9,6 @@ config:
   spreadsheet-library-tracking-metadata:lz-bucket: orcahouse-dev-landing-zone-115253169271-ap-southeast-2-an
   spreadsheet-library-tracking-metadata:rs-workgroup: orcahouse-dev
   spreadsheet-library-tracking-metadata:rs-role: arn:aws:iam::115253169271:role/dev-redshift-namespace-role
+  # This dev trigger was armed out of band and has been running daily. Declared here so
+  # the config matches the live AWS state; see README "Scheduled trigger in dev".
+  spreadsheet-library-tracking-metadata:trigger-enabled: "true"

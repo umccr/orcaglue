@@ -1,6 +1,7 @@
 <!-- TOC -->
 * [OrcaGlue](#orcaglue)
   * [Development](#development)
+  * [Deployment](#deployment)
   * [New ETL Module](#new-etl-module)
   * [Simple Data Loading](#simple-data-loading)
 <!-- TOC -->
@@ -30,6 +31,22 @@ make install
 make check
 ```
 
+## Deployment
+
+See **[README_DEPLOY.md](README_DEPLOY.md)** for the full deployment reference — prerequisites,
+stack configuration, the deploy process, dev and prod deployment, scheduled triggers, dry runs
+and troubleshooting.
+
+The same five steps apply to every stage, and the order matters because the `tsa` schema and the
+Glue role grants are owned by the `shared-infra` stack rather than by the modules.
+
+```
+1. shared-infra   →   2. init.sql   →   3. refresh grants   →   4. module stacks   →   5. validate
+```
+
+See [Deploy Process](README_DEPLOY.md#deploy-process) for what each step does and why the order is
+fixed. Each module README covers only what is specific to that module.
+
 ## New ETL Module
 
 Create a new project using the template and go to the project directory.
@@ -38,47 +55,25 @@ cp -R _template sample-job
 cd sample-job
 ```
 
-Login to Pulumi backend. Need an authenticated AWS session.
-```
-pulumi whoami --verbose --non-interactive
+Update the `# FIXME` markers in the copied files.
 
-export AWS_PROFILE=unimelb-warehouse-prod-admin
-aws sso login
+* `Pulumi.yaml` — project `name` and `description`.
+* `Pulumi.dev.yaml` — the `<project-name>:` key prefix and `job-script`.
+* `__main__.py` — `job_name` and `base_name`.
 
-pulumi login s3://pulumi-state-115253169271-ap-southeast-2-an/orcaglue
-```
+Rename `job/sample.py`, write the ETL logic, and add the target table DDL as `job/init.sql`.
+Then remove the `## REMOVE_ME` scaffolding section from the module README.
 
-Initialize the Pulumi dev stack.
-```
-pulumi stack init dev --secrets-provider="awskms://alias/pulumi-state-key"
-```
-
-Deploy the ETL.
-```
-pulumi stack select dev
-pulumi stack ls
-pulumi preview
-pulumi up
-pulumi stack output
-pulumi stack
-pulumi stack --show-urns
-```
-
-Try to run the job via AWS CLI. You may opt to do so via Glue Console UI as well.
+Deploy it by following [README_DEPLOY.md](README_DEPLOY.md), then run the job.
 ```
 aws glue list-jobs
 aws glue start-job-run --job-name orcaglue-dev-sample-job-job
-aws glue get-job-run --job-name orcaglue-dev-sample-job-job --run-id jr_1cd13010b965e071fee72fa776211224feb6b3e0f2d42f7fe87178485cdeab65
 ```
 
-Tear down the stack.
+Clean up the throwaway project when you are done experimenting.
 ```
 pulumi destroy
 pulumi stack rm dev
-```
-
-Clean up the project directory.
-```
 cd ..
 rm -rf sample-job
 ```

@@ -1,0 +1,322 @@
+# Deployment
+
+<!-- TOC -->
+* [Deployment](#deployment)
+  * [Prerequisites](#prerequisites)
+  * [Stack Configuration](#stack-configuration)
+  * [Deploy Process](#deploy-process)
+    * [Why the order is fixed](#why-the-order-is-fixed)
+  * [Dev Deployment](#dev-deployment)
+  * [Production Deployment](#production-deployment)
+  * [Enable the scheduled trigger](#enable-the-scheduled-trigger)
+  * [Dry Run](#dry-run)
+  * [Verifying a Deployment](#verifying-a-deployment)
+  * [Teardown](#teardown)
+  * [Troubleshooting](#troubleshooting)
+<!-- TOC -->
+
+This is the single reference for deploying any ETL module, to `dev` or to `prod`. Each module
+README covers only what is specific to that module — its config values, its target table and
+its own quirks.
+
+We use Pulumi to orchestrate deployment. Every module is an independent Pulumi project with a
+`dev` and a `prod` stack.
+
+## Prerequisites
+
+**1. Python environment.** Create a virtual environment (any method) and install the dev
+toolchain. See [README_DEV.md](README_DEV.md) for the Python version requirement.
+
+First-time setup, from the repository root:
+```
+conda activate orcaglue
+make install
+make check
+```
+
+Afterwards, just activate it:
+```
+conda activate orcaglue
+```
+
+**2. Authenticated AWS session with admin privilege.**
+```
+export AWS_PROFILE=unimelb-warehouse-prod-admin
+aws sso login
+```
+_Admin is required because deploying a Glue job needs `iam:PassRole`. Ask Victor to apply the
+stack changes if you are not an admin._
+
+**3. Pulumi backend login.**
+```
+pulumi whoami --verbose --non-interactive
+pulumi login s3://pulumi-state-115253169271-ap-southeast-2-an/orcaglue
+```
+
+## Stack Configuration
+
+Each module holds a `Pulumi.dev.yaml` and a `Pulumi.prod.yaml`. Config keys are namespaced by
+the Pulumi project name, i.e. `<project-name>:<key>`.
+
+| Key | Purpose |
+|---|---|
+| `shared-infra` | `StackReference` path to the shared stack supplying the Glue role, e.g. `organization/shared-infra/dev` |
+| `requirements` | Path to the shared `requirements.txt` uploaded as the job's Python deps |
+| `job-script` | Path to the ETL script uploaded to S3 and run by Glue |
+| `lz-bucket` | Landing-zone S3 bucket for the job script and generated artefacts |
+| `rs-workgroup` | Redshift Serverless workgroup targeted by the Data API |
+| `rs-role` | IAM role ARN Redshift assumes for `COPY` from S3 |
+| `trigger-enabled` | Opt-in switch for the scheduled trigger. Defaults to `false` |
+| `schedule` | Cron for the trigger. Defaults to `cron(10 13 * * ? *)` |
+
+Stage values:
+
+| | dev | prod |
+|---|---|---|
+| `lz-bucket` | `orcahouse-dev-landing-zone-115253169271-ap-southeast-2-an` | `orcahouse-prod-landing-zone-115253169271-ap-southeast-2-an` |
+| `rs-workgroup` | `orcahouse-dev` | `orcahouse-prod` |
+| `rs-role` | `arn:aws:iam::115253169271:role/dev-redshift-namespace-role` | `arn:aws:iam::115253169271:role/prod-redshift-namespace-role` |
+| `shared-infra` | `organization/shared-infra/dev` | `organization/shared-infra/prod` |
+| Glue role | `orcaglue-shared-infra-glue-job-role-dev` | `orcaglue-shared-infra-glue-job-role-prod` |
+
+> Check that `shared-infra` points at the matching stage. A prod module pointing at
+> `organization/shared-infra/dev` would be handed the **dev** Glue role, which has no access to
+> prod resources.
+
+Both `dev` and `prod` live in the same AWS account (`115253169271`) and region
+(`ap-southeast-2`). Isolation is by bucket, workgroup, role name and stack stage only — there is
+no account boundary between them.
+
+## Deploy Process
+
+The same five steps apply to **every stage**. `dev` and `prod` differ only in the values used and
+in how much caution each step warrants — not in the logic.
+
+```
+1. shared-infra      2. init.sql        3. refresh grants    4. module stacks     5. validate
+   role perms +   →     target       →     make tables    →     Glue jobs,     →    dry run,
+   tsa schema           tables              writable             triggers off        then live
+```
+
+| Step | What it produces | Run by |
+|---|---|---|
+| 1. `shared-infra` | Shared Glue execution role, its inline policy (S3, SSM, Redshift Data API), the `tsa` schema, and the initial grants | Pulumi, admin |
+| 2. `init.sql` | One target table per module in the `tsa` schema | Redshift Query Editor, **poweruser** |
+| 3. Refresh grants | Makes those tables readable and writable by the Glue role | Query Editor or Pulumi |
+| 4. Module stacks | Glue job, uploaded job script, and a trigger that ships **disabled** | Pulumi, admin |
+| 5. Validate | A dry run, then a live run, then optionally the schedule | AWS CLI or Glue console |
+
+Steps 1–3 are infrastructure groundwork and are done **once per stage**. Steps 4–5 are per module
+and are what you repeat on every routine deployment.
+
+### Why the order is fixed
+
+The `tsa` schema and the Glue role grants are owned by the `shared-infra` stack, not by the
+modules. That creates three hard dependencies:
+
+* **1 before 2** — every `init.sql` references `orcavault.tsa.<table>`, and the `tsa` schema is
+  created in step 1. Running `init.sql` first fails because the schema does not exist.
+* **2 before 3** — step 1's `GRANT ... ON ALL TABLES` runs while `tsa` is still empty, so it
+  matches nothing. `ALTER DEFAULT PRIVILEGES` only covers tables created by the same database
+  user that set it, and step 2 creates them as a different user. The tables are therefore not
+  reliably writable until the grants are re-applied *after* they exist.
+* **1 before 4** — each module reads `shared_glue_role_arn` from the `shared-infra` stack through
+  a `StackReference`, so that output must exist before a module stack can deploy.
+
+Triggers stay disabled until step 5 passes, so nothing runs unattended before a human has seen it
+succeed once.
+
+> Skipping step 3 is the most common cause of a first-run failure: the job uploads its artefacts,
+> then fails with a permission error on `TRUNCATE` or `COPY`.
+
+## Dev Deployment
+
+Steps 1–3 of the [Deploy Process](#deploy-process) are already in place for `dev`. Routine work is
+steps 4 and 5.
+
+Confirm the shared stack output exists:
+```
+cd shared-infra
+pulumi stack select dev
+pulumi stack output shared_glue_role_arn
+cd ..
+```
+
+**Step 4 — deploy the module.** From the module directory, initialise the stack if it has never
+been created:
+```
+pulumi stack init dev --secrets-provider="awskms://alias/pulumi-state-key"
+```
+
+Then deploy:
+```
+pulumi stack select dev
+pulumi stack ls
+pulumi preview
+pulumi up
+pulumi stack output
+pulumi stack --show-urns
+```
+
+**Step 5 — validate.** Run the job. See [Dry Run](#dry-run) to exercise it without writing to
+Redshift, and [Verifying a Deployment](#verifying-a-deployment) for the checks.
+```
+aws glue start-job-run --job-name orcaglue-dev-<module>-job
+```
+
+If you added or changed a module's table, do steps 2 and 3 for `dev` as well — run its
+`job/init.sql`, then refresh the grants against the dev role
+`orcaglue-shared-infra-glue-job-role-dev`.
+
+## Production Deployment
+
+All five steps of the [Deploy Process](#deploy-process), in order. Prod has never been deployed
+for a module until you do it, so treat every step as first-time.
+
+**Step 1 — apply `shared-infra` prod.**
+```
+cd shared-infra
+pulumi stack select prod
+pulumi preview
+pulumi up
+pulumi stack output shared_glue_role_arn
+```
+Review the preview before applying. It should only **add** resources. Stop if it proposes deleting
+or replacing the IAM role — that ARN is the identity granted inside Redshift, so it must not
+change.
+
+**Step 2 — create the target tables.** Run each module's `job/init.sql` in Redshift Query Editor
+against the prod workgroup, as the warehouse **poweruser**.
+
+Each `init.sql` is `DROP TABLE IF EXISTS` followed by `CREATE TABLE`, so it is destructive on
+re-run. Run it once per table, and never while a job or a downstream transformation is active.
+
+**Step 3 — refresh the Glue role grants.** Idempotent, so always run it after creating or
+recreating a table. See [Refresh Grant Glue Role](shared-infra/README.md#refresh-grant-glue-role).
+
+Confirm before running any job:
+```sql
+SELECT has_table_privilege('IAMR:orcaglue-shared-infra-glue-job-role-prod',
+                           'tsa.<table_name>', 'INSERT');
+```
+All target tables must return `true`.
+
+**Step 4 — deploy the modules, one at a time.** From each module directory:
+```
+pulumi stack init prod --secrets-provider="awskms://alias/pulumi-state-key"
+pulumi stack select prod
+pulumi config
+pulumi preview
+pulumi up
+pulumi stack output
+```
+The preview should show the `orcaglue-prod-*` Glue job, S3 objects under
+`orcaglue/<base_name>/prod/`, a role ARN ending in `-prod`, and the trigger disabled. Do not start
+the next module until the current one has passed step 5.
+
+**Step 5 — validate a manual run.** Dry run first, then a live run:
+```
+aws glue start-job-run --job-name orcaglue-prod-<module>-job --arguments '{"--dry_run":"true"}'
+aws glue start-job-run --job-name orcaglue-prod-<module>-job
+```
+Only then consider [enabling the scheduled trigger](#enable-the-scheduled-trigger).
+
+## Enable the scheduled trigger
+
+Triggers ship **disabled** in every stack so a deployment can be validated by hand first.
+Enable one module at a time, and keep the schedules staggered so the jobs do not contend on the
+same Redshift workgroup.
+
+| Module | Schedule (UTC) | Local (AEST/AEDT) |
+|---|---|---|
+| `spreadsheet-google-lims` | `cron(10 13 * * ? *)` | 00:10 |
+| `spreadsheet-library-tracking-metadata` | `cron(25 13 * * ? *)` | 00:25 |
+| `spreadsheet-ica-usage-report` | `cron(40 13 * * ? *)` | 00:40 |
+
+```
+pulumi config set <project-name>:trigger-enabled true
+pulumi preview
+pulumi up
+aws glue get-trigger --name orcaglue-<stage>-<module>-job-scheduled-trigger --query 'Trigger.State'
+```
+
+`CREATED` means disabled, `ACTIVATED` means live.
+
+To stop a schedule quickly without a deployment:
+```
+aws glue stop-trigger --name orcaglue-<stage>-<module>-job-scheduled-trigger
+```
+Then persist it with `pulumi config set <project-name>:trigger-enabled false && pulumi up`,
+otherwise the next `pulumi up` re-arms it.
+
+> A trigger armed or stopped out of band with the AWS CLI is invisible to `pulumi preview`
+> without a refresh, so Pulumi state is not proof of the live state. Always confirm with
+> `aws glue get-trigger`.
+
+## Dry Run
+
+Every ETL module supports `--dry_run`. A dry run performs the real extract and transform and
+still uploads the generated artefacts to S3, then stops before the Redshift `TRUNCATE` and
+`COPY`. That makes it a safe smoke test against a real environment.
+
+Deployed jobs default to `--dry_run=false`. Override it for a single ad-hoc run:
+```
+aws glue start-job-run \
+  --job-name orcaglue-<stage>-<module>-job \
+  --arguments '{"--dry_run":"true"}'
+```
+
+Locally, inside the Glue container:
+```
+make run-dry
+```
+
+## Verifying a Deployment
+
+After `pulumi up`, confirm the job is wired to the intended stage:
+```
+aws glue get-job --job-name orcaglue-<stage>-<module>-job \
+  --query 'Job.{Role:Role,Args:DefaultArguments,Ver:GlueVersion,Workers:NumberOfWorkers}'
+```
+
+Check that `--lz_bucket`, `--rs_workgroup`, `--rs_role` and `--s3_mid_path` all carry the values
+for the stage you deployed, and that the role ARN ends with that stage.
+
+After a job run:
+```
+aws glue get-job-run --job-name orcaglue-<stage>-<module>-job --run-id <id> \
+  --query 'JobRun.{S:JobRunState,Secs:ExecutionTime,Err:ErrorMessage}'
+```
+
+`JobRunState` should be `SUCCEEDED`. Job logs are in CloudWatch under `/aws-glue/jobs`. Then
+confirm the row count on the target table in Redshift.
+
+## Teardown
+
+Destroys only that module's resources — its Glue job, trigger and uploaded S3 objects:
+```
+pulumi destroy
+pulumi stack rm <stage>
+```
+
+Do not `pulumi destroy` the `shared-infra` stack while any module stack still references its
+output; that would remove the Glue role every module depends on.
+
+## Troubleshooting
+
+**Permission denied on `TRUNCATE` or `COPY`.** The Glue role lacks privileges on the target
+table. Re-run step 3 of the [Deploy Process](#deploy-process) and verify with
+`has_table_privilege`. This is the usual cause after a table has been dropped and recreated.
+
+**`COPY` fails on an unknown column.** The table schema is behind the job's expected columns.
+Re-run the module's `job/init.sql` (step 2), then refresh the grants again (step 3).
+
+**`init.sql` fails saying the schema does not exist.** Step 1 has not been applied for that
+stage. See [Why the order is fixed](#why-the-order-is-fixed).
+
+**Preview wants to replace the IAM role or create a whole new stack.** Stop. You are probably on
+the wrong stack, or the project name changed. Check `pulumi stack ls` and `pulumi config`.
+
+**Job script changes are not picked up.** The S3 object uses an MD5 `etag`, so a `pulumi up` is
+required to re-upload the script after editing it. Note the prod landing-zone bucket is not
+versioned, so `git revert` plus `pulumi up` is the only way to roll a script back.

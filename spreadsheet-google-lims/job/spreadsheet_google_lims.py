@@ -37,6 +37,20 @@ OUT_PATH = None
 REGION_NAME = "ap-southeast-2"
 
 
+def parse_bool(value: str | bool | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+
+    value = value.strip().lower()
+    if value in {"1", "true", "t", "yes", "y"}:
+        return True
+    if value in {"0", "false", "f", "no", "n"}:
+        return False
+    raise ValueError(f"Cannot parse boolean value: {value}")
+
+
 def extract():
     spreadsheet_id = libssm.get_secret(LIMS_SHEET_ID)
     account_info = libssm.get_secret(GDRIVE_SERVICE_ACCOUNT)
@@ -171,13 +185,8 @@ def _wait_for_query(client, statement_id: str):
         time.sleep(2)
 
 
-def load(bucket: str, workgroup: str, role: str):
-    """
-    Load staged CSV data into Redshift Serverless via:
-      1. Upload CSV and SQL artefacts to S3
-      2. TRUNCATE the target table
-      3. COPY from S3 into Redshift Serverless using the Data API
-    """
+def upload_artifacts(bucket: str) -> str:
+    """Upload the generated CSV and SQL artefacts to S3 and return the CSV S3 URI."""
 
     csv_file = f"{OUT_PATH}.csv"
     sql_file = f"{OUT_PATH}.sql"
@@ -185,18 +194,19 @@ def load(bucket: str, workgroup: str, role: str):
     csv_s3_object_name = f"{S3_MID_PATH}/{os.path.basename(csv_file)}"
     sql_s3_object_name = f"{S3_MID_PATH}/{os.path.basename(sql_file)}"
 
-    # --- Step 1: Upload artefacts to S3 ---
-
     s3_client = libs3.s3_client()
     s3_client.upload_file(csv_file, bucket, csv_s3_object_name)
     s3_client.upload_file(sql_file, bucket, sql_s3_object_name)
     print(f"Uploaded CSV  → s3://{bucket}/{csv_s3_object_name}")
     print(f"Uploaded SQL  → s3://{bucket}/{sql_s3_object_name}")
 
-    # --- Step 2: Truncate + COPY via Redshift Data API ---
+    return f"s3://{bucket}/{csv_s3_object_name}"
+
+
+def load_to_redshift(workgroup: str, role: str, s3_csv_uri: str):
+    """TRUNCATE the target table then COPY the staged CSV via the Redshift Data API."""
 
     table_name = f"{SCHEMA_NAME}.{BASE_NAME}"
-    s3_csv_uri = f"s3://{bucket}/{csv_s3_object_name}"
 
     truncate_sql = f"TRUNCATE TABLE {table_name};"
 
@@ -235,6 +245,18 @@ def load(bucket: str, workgroup: str, role: str):
     print(f"Load complete → {table_name}")
 
 
+def load(bucket: str, workgroup: str, role: str):
+    """
+    Load staged CSV data into Redshift Serverless via:
+      1. Upload CSV and SQL artefacts to S3
+      2. TRUNCATE the target table
+      3. COPY from S3 into Redshift Serverless using the Data API
+    """
+
+    s3_csv_uri = upload_artifacts(bucket)
+    load_to_redshift(workgroup=workgroup, role=role, s3_csv_uri=s3_csv_uri)
+
+
 def clean_up():
     # os.remove(LOCAL_TEMP_FILE)
     pass  # for now
@@ -256,12 +278,15 @@ class GlueGoogleLIMS(Job):
             params.append("base_name")
         if "--s3_mid_path" in sys.argv:
             params.append("s3_mid_path")
+        if "--dry_run" in sys.argv:
+            params.append("dry_run")
 
         args = getResolvedOptions(sys.argv, params)
 
         self.bucket = args["lz_bucket"]
         self.workgroup = args["rs_workgroup"]
         self.role = args["rs_role"]
+        self.dry_run = parse_bool(args.get("dry_run"))
 
         job_name = args.get("JOB_NAME", "GlueGoogleLIMS")
         self.init(job_name, args)
@@ -283,8 +308,12 @@ class GlueGoogleLIMS(Job):
 
         transform()
 
-        # comment out the following line to skip loading into Redshift
-        load(bucket=self.bucket, workgroup=self.workgroup, role=self.role)
+        # Use --dry_run true to upload the artefacts without touching Redshift.
+        if self.dry_run:
+            upload_artifacts(self.bucket)
+            print("Dry run enabled: skipping Redshift load")
+        else:
+            load(bucket=self.bucket, workgroup=self.workgroup, role=self.role)
 
         clean_up()
 

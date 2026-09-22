@@ -7,7 +7,6 @@
     - [Source Report Layouts](#source-report-layouts)
     - [Load and Validation Flow](#load-and-validation-flow)
   - [Deployment](#deployment)
-    - [Development Prerequisites](#development-prerequisites)
   - [Redshift Table Setup](#redshift-table-setup)
   - [Glue Job Run](#glue-job-run)
   - [Local Development](#local-development)
@@ -95,59 +94,27 @@ The manifest `source_layouts` field counts how many source files used each layou
 
 ## Deployment
 
-### Development Prerequisites
+Follow **[README_DEPLOY.md](../README_DEPLOY.md)** for prerequisites, the Pulumi flow and the
+production deployment order.
 
-Before deploying, create a Python virtual environment using any method and install the development toolchain [requirements](../requirements-dev.txt).
+Module-specific config, in [Pulumi.dev.yaml](Pulumi.dev.yaml) and [Pulumi.prod.yaml](Pulumi.prod.yaml):
 
-See [README_DEV.md](../README_DEV.md) for the Python version requirement and more comprehensive setup details.
+| Key | Value | Purpose |
+|---|---|---|
+| `source-prefix` | `ica-usage-reports/` | S3 prefix holding the raw ICA report CSV files |
+| `trigger-enabled` | `"false"` | Schedule stays off until a manual run is validated |
+| `schedule` | `cron(40 13 * * ? *)` | 00:40 AEST/AEDT, staggered behind the other modules |
 
-> For the first-time setup, run the following from the repository root:
->
-> ```bash
-> conda activate orcaglue
-> make install
-> make check
-> ```
+Other keys are the shared ones described in
+[Stack Configuration](../README_DEPLOY.md#stack-configuration).
 
-If the environment and dependencies were installed previously, only activate the environment:
+> **Before the first prod deployment:** steps 1-3 of the
+> [Deploy Process](../README_DEPLOY.md#deploy-process) must be done for `prod` — apply
+> `shared-infra`, run [job/init.sql](job/init.sql), then refresh the Glue role grants. The `tsa`
+> schema and the grants are owned by the `shared-infra` stack, not by this module.
 
-```bash
-conda activate orcaglue
-```
-
-We use Pulumi to orchestrate deployment of the ETL.
-
-Authenticate an AWS session with administrator access:
-
-```bash
-export AWS_PROFILE=unimelb-warehouse-prod-admin
-aws sso login
-```
-
-Administrator access is required for `iam:PassRole`. Ask an administrator to apply the stack changes if you do not have that permission.
-
-Log in to the Pulumi backend:
-
-```bash
-pulumi login s3://pulumi-state-115253169271-ap-southeast-2-an/orcaglue
-```
-
-> **Notice** The shared infrastructure stack must already exist because this module reads its `shared_glue_role_arn` output.
->
-> ```bash
-> cd shared-infra
-> pulumi stack select dev
-> pulumi stack output shared_glue_role_arn
-> cd ..
-> ```
->
-> And, then change back to the to the module root:
->
-> ```bash
-> cd spreadsheet-ica-usage-report
-> ```
-
-> **Notice — existing deployments only:** Preserve the Pulumi stack state and history by renaming the project in the existing stack. Do not initialise a second stack under the new project name.
+> **Notice — existing deployments only:** Preserve the Pulumi stack state and history by renaming
+> the project in the existing stack. Do not initialise a second stack under the new project name.
 >
 > ```bash
 > pulumi stack rename organization/spreadsheet-ica-usage-report/dev \
@@ -155,28 +122,9 @@ pulumi login s3://pulumi-state-115253169271-ap-southeast-2-an/orcaglue
 > pulumi stack select organization/spreadsheet-ica-usage-report/dev
 > ```
 >
-> This is a one-time manual cutover action. Run it before the first preview from the renamed project.
-
-If the stack has never been created, initialise it:
-
-```bash
-pulumi stack init dev --secrets-provider="awskms://alias/pulumi-state-key"
-```
-
-Deploy the ETL:
-
-```bash
-pulumi stack select dev
-pulumi stack ls
-pulumi preview
-pulumi up
-pulumi stack output
-pulumi stack --show-urns
-```
-
-The preview should contain the intended Glue/S3 naming changes while retaining the existing stack resources. Stop if it proposes creating an entirely new stack. The scheduled trigger remains disabled during the cutover.
-
-A prod stack configuration is intentionally not included because the prod workspace does not exist for this module yet.
+> This is a one-time manual cutover action. Run it before the first preview from the renamed
+> project. The preview should contain the intended Glue/S3 naming changes while retaining the
+> existing stack resources. Stop if it proposes creating an entirely new stack.
 
 ## Redshift Table Setup
 
@@ -190,30 +138,10 @@ The script uses `DROP TABLE IF EXISTS` followed by `CREATE TABLE` so an existing
 
 The legacy `tsa.csv__ica_usage_report` table is not removed by this script. Keep it until the renamed job is validated and downstream consumers have been switched.
 
-> **Notice — refresh the Glue role grants:** If you rename the table or physically drop and recreate it in Redshift Query Editor, refresh the shared Glue execution role grants before the next Glue job run. See [Refresh Grant Glue Role](../shared-infra/README.md#refresh-grant-glue-role) in the shared infrastructure documentation.
->
-> From the repository root, select the `shared-infra` stack and refresh the grant statement. This operation is idempotent:
->
-> ```bash
-> cd shared-infra
-> pulumi stack select dev
-> pulumi up --replace 'urn:pulumi:dev::shared-infra::aws:redshiftdata/statement:Statement::orcaglue-shared-infra-glue-role-tsa-grants-dev'
-> ```
->
-> Alternatively, run the following directly in Redshift Query Editor as the warehouse power user:
->
-> ```sql
-> GRANT USAGE ON SCHEMA tsa TO "IAMR:orcaglue-shared-infra-glue-job-role-dev";
->
-> GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE
-> ON ALL TABLES IN SCHEMA tsa
-> TO "IAMR:orcaglue-shared-infra-glue-job-role-dev";
->
-> ALTER DEFAULT PRIVILEGES IN SCHEMA tsa
-> GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE
-> ON TABLES
-> TO "IAMR:orcaglue-shared-infra-glue-job-role-dev";
-> ```
+> **Notice — refresh the Glue role grants:** If you rename the table, or drop and recreate it in
+> Redshift Query Editor, refresh the shared Glue execution role grants before the next job run,
+> otherwise the load fails with a permission error. The statements are idempotent. See
+> [Refresh Grant Glue Role](../shared-infra/README.md#refresh-grant-glue-role).
 
 ## Glue Job Run
 
@@ -242,64 +170,32 @@ The former `--load_enabled` argument is no longer used. Use `--dry_run=true` onl
 
 ## Local Development
 
-Read [README_LOCAL.md](../README_LOCAL.md) for local development.
-
-Set up the shared Python 3.11 Conda environment as described in [README_DEV.md](../README_DEV.md).
-
-Authenticate the AWS session and use Granted to export temporary credentials before creating the Glue container:
-
-```bash
-export AWS_PROFILE=unimelb-warehouse-prod-admin
-aws sso login
-assume unimelb-warehouse-prod-admin
-```
-
-Confirm that Granted exported credentials without displaying their values:
-
-```bash
-if [[ -n "$AWS_ACCESS_KEY_ID" &&
-      -n "$AWS_SECRET_ACCESS_KEY" &&
-      -n "$AWS_SESSION_TOKEN" ]]; then
-  echo "AWS temporary credentials available"
-fi
-```
-
-Change to the module root and bring up the local Glue stack:
+See [Run a Module](../README_LOCAL.md#run-a-module) for the local Glue container workflow, using
+`spreadsheet-ica-usage-report` as the module.
 
 ```bash
 cd spreadsheet-ica-usage-report
 make up
-make ps
 make glue
-```
-
-If the container was created before assuming the role, or the temporary credentials were refreshed, run `make reload` before `make glue`.
-
-Inside the Glue container, change to the module root and run the diagnostics:
-
-```bash
+# inside the container
 cd workspace/spreadsheet-ica-usage-report/
 make debug
-```
-
-Run the ETL and load the current snapshot into dev Redshift:
-
-```bash
 make run
 ```
 
-`make run` uses `--dry_run false`. It reads the source CSV files, uploads the consolidated CSV, SQL and manifest artifacts, then refreshes the TSA table.
-
-For an isolated test prefix, use dry-run mode so test data is not loaded into the shared TSA table:
-
-```bash
-make run-dry source_prefix=ica-usage-reports-local/your-name/
-```
+`make run` uses `--dry_run false`. It reads the source CSV files, uploads the consolidated CSV,
+SQL and manifest artifacts, then refreshes the TSA table.
 
 To process the normal source without loading Redshift:
 
 ```bash
 make run-dry
+```
+
+For an isolated test prefix, so test data is never loaded into the shared TSA table:
+
+```bash
+make run-dry source_prefix=ica-usage-reports-local/your-name/
 ```
 
 Run the focused unit tests from the module root in the Conda environment:
@@ -312,14 +208,10 @@ Override the interpreter when needed with `make test PYTHON=/path/to/python`.
 
 ## Destroy
 
-Destroy only this module's Pulumi resources with:
+See [Teardown](../README_DEPLOY.md#teardown).
 
-```bash
-pulumi destroy
-pulumi stack rm dev
-```
-
-Do not destroy or delete the legacy OrcaHouse job until the new TSA table and downstream OrcaVault dbt chain have been validated and consumers have switched.
+Do not destroy or delete the legacy OrcaHouse job until the new TSA table and downstream
+OrcaVault dbt chain have been validated and consumers have switched.
 
 ## History
 
