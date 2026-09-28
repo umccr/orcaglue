@@ -304,19 +304,85 @@ output; that would remove the Glue role every module depends on.
 
 ## Troubleshooting
 
-**Permission denied on `TRUNCATE` or `COPY`.** The Glue role lacks privileges on the target
+1. **Permission denied on `TRUNCATE` or `COPY`.** The Glue role lacks privileges on the target
 table. Re-run step 3 of the [Deploy Process](#deploy-process) and verify with
 `has_table_privilege`. This is the usual cause after a table has been dropped and recreated.
 
-**`COPY` fails on an unknown column.** The table schema is behind the job's expected columns.
+2. **`COPY` fails on an unknown column.** The table schema is behind the job's expected columns.
 Re-run the module's `job/init.sql` (step 2), then refresh the grants again (step 3).
 
-**`init.sql` fails saying the schema does not exist.** Step 1 has not been applied for that
+3. **`init.sql` fails saying the schema does not exist.** Step 1 has not been applied for that
 stage. See [Why the order is fixed](#why-the-order-is-fixed).
 
-**Preview wants to replace the IAM role or create a whole new stack.** Stop. You are probably on
+4. **Grants fail with `user "IAMR:orcaglue-shared-infra-glue-job-role-<stage>" does not exist`.**
+Seen on a first-time `shared-infra` apply for a new stage (typically prod): `pulumi up` reports
+the inline policy and `CREATE SCHEMA tsa` as created, but the `tsa-grants-<stage>` statement
+errors. This is *not* a tables problem — a `GRANT USAGE ON SCHEMA` needs no tables; the failure is
+that the *grantee* does not exist. Redshift creates an IAM identity's database user
+(`IAMR:<role>`) lazily, on that role's **first authentication** to Redshift — not when the IAM
+role is created. A brand-new prod Glue role has never connected, so `IAMR:...-prod` is not yet a
+known user and the `GRANT` to it fails. (Dev rarely hits this because its role connected long ago,
+so the user already exists.) Confirm with an empty `pg_user` match for the role. Fix: create the
+user explicitly in Query Editor as the **poweruser**, then re-apply just the failed grants via
+Pulumi:
+```sql
+CREATE USER "IAMR:orcaglue-shared-infra-glue-job-role-prod" WITH PASSWORD DISABLE;
+```
+```
+cd shared-infra
+pulumi stack select prod
+pulumi stack --show-urns   # copy the tsa-grants-prod URN
+pulumi up --replace 'urn:pulumi:prod::shared-infra::aws:redshiftdata/statement:Statement::orcaglue-shared-infra-glue-role-tsa-grants-prod'
+```
+`WITH PASSWORD DISABLE` matches the "password disabled" behaviour Redshift uses for its own
+auto-created IAM users. `create-schema` and the inline policy are already done, so a plain
+`pulumi up` shows them `unchanged` — only the grants need `--replace`. **Notice:** this happens
+before step 2, so `tsa` still has no tables. `GRANT USAGE ON SCHEMA` and `ALTER DEFAULT
+PRIVILEGES` apply fine, but `GRANT ... ON ALL TABLES IN SCHEMA tsa` matches zero tables. You must
+still refresh the grants again after step 2 creates the tables (step 3). Net order: create user →
+replace grants → create tables (step 2) → refresh grants (step 3) → verify with
+`has_table_privilege`.
+
+5. **Preview wants to replace the IAM role or create a whole new stack.** Stop. You are probably on
 the wrong stack, or the project name changed. Check `pulumi stack ls` and `pulumi config`.
 
-**Job script changes are not picked up.** The S3 object uses an MD5 `etag`, so a `pulumi up` is
+6. **Job script changes are not picked up.** The S3 object uses an MD5 `etag`, so a `pulumi up` is
 required to re-upload the script after editing it. Note the prod landing-zone bucket is not
 versioned, so `git revert` plus `pulumi up` is the only way to roll a script back.
+
+7. **Redshift Query Editor v2 does not show the `orcahouse-prod` workgroup.** Seen when running
+step 2 (`init.sql`) or step 3 (grants) against prod for the first time: QEv2's workgroup dropdown
+lists dev but not `orcahouse-prod`, so there is nothing to connect to. It is not a permissions or
+provisioning problem — the workgroup exists; QEv2 is either pointed at the wrong region or has a
+stale connection list that predates the prod workgroup being created. Fix, in order: (a) confirm
+the console region selector (top-right) reads **Asia Pacific (Sydney) `ap-southeast-2`**, then
+hard-reload QEv2 (`Cmd-Shift-R`) or close and reopen the tab — the dropdown often just has not
+refreshed since prod was created; (b) if it still does not appear, explicitly create the
+connection in the QEv2 left panel via **+ Create connection** (or the connection dropdown → add)
+with **Workgroup:** `orcahouse-prod`, **Authentication:** *Federated user* (uses your current IAM
+session, the same way dev connects), **Database:** `orcavault`. **Notice:** everything in this
+repo lives in `ap-southeast-2`; a workgroup "missing" from QEv2 is almost always the region
+selector on another region, not a real infrastructure gap — verify the region before creating new
+connections.
+
+8. **`ERROR: permission denied for schema tsa` when running `init.sql`.** Seen at step 2 in prod:
+you are connected to `orcahouse-prod` as the **poweruser** (Federated
+`AWSReservedSSO_AWSPowerUserAccess_...`) and `CREATE TABLE` in `tsa` is rejected even though the
+schema exists. The cause is schema **ownership**, not a missing grant — `shared-infra` created
+`tsa` via the Redshift Data API under whichever identity ran `pulumi up`, so the poweruser is not
+the schema owner and cannot create objects in it. In dev this is invisible because `tsa` there is
+already owned by the poweruser. Fix: reassign schema ownership to the poweruser in Query Editor
+v2, then re-run `init.sql`:
+```sql
+ALTER SCHEMA tsa OWNER TO "IAMR:AWSReservedSSO_AWSPowerUserAccess_<suffix>";
+```
+Verify it now matches dev (should return the poweruser as `schema_owner`):
+```sql
+SELECT n.nspname, u.usename AS schema_owner
+FROM pg_namespace n JOIN pg_user u ON n.nspowner = u.usesysid
+WHERE n.nspname = 'tsa';
+```
+**Notice:** the `<suffix>` in the SSO user name is environment-specific — look up your own
+poweruser name from the verify query's dev result or from `SELECT current_user;` and substitute it
+before running the `ALTER`. This is a one-time ownership fix per stage; it does not replace the step-3 grants
+that make tables readable/writable by the Glue role.

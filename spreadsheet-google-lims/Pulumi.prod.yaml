@@ -11,3 +11,6 @@ config:
   spreadsheet-google-lims:trigger-enabled: "false"
   # 13:10 UTC = AEST/AEDT 00:10 AM. Staggered against the other ETL modules.
   spreadsheet-google-lims:schedule: cron(10 13 * * ? *)
+# KMS-encrypted key material (not a plaintext secret); committed so the stack is decryptable by anyone with KMS access.
+secretsprovider: awskms://alias/pulumi-state-key # pragma: allowlist secret
+encryptedkey: AQICAHjiIoInMawFdg3zsGPUuqK2Y2wKhSCcloZUamCbvHLzOQEZVq+l+XWVCSTFE+e22vzlAAAAfjB8BgkqhkiG9w0BBwagbzBtAgEAMGgGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMrNSyCH/OD65K0E/IAgEQgDtKJvLdvDnLPUTqk3PE7Z3XtS4/Pred6v+gQhmPnGSbfwWYu+A5OJ2H6fTZXY2foFgqwhAsXUSMm2zyqg== # pragma: allowlist secret

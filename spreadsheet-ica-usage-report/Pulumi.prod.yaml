@@ -14,3 +14,6 @@ config:
   spreadsheet-ica-usage-report:trigger-enabled: "false"
   # 13:40 UTC = AEST/AEDT 00:40 AM. Staggered behind the other ETL modules.
   spreadsheet-ica-usage-report:schedule: cron(40 13 * * ? *)
+# KMS-encrypted key material (not a plaintext secret); committed so the stack is decryptable by anyone with KMS access.
+secretsprovider: awskms://alias/pulumi-state-key # pragma: allowlist secret
+encryptedkey: AQICAHjiIoInMawFdg3zsGPUuqK2Y2wKhSCcloZUamCbvHLzOQEvoYUqFUdgpU++xQTWrxkLAAAAfjB8BgkqhkiG9w0BBwagbzBtAgEAMGgGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMQpCLaN+a2P/b/zBBAgEQgDvlA9LHii1DSKTRRM1M0wnh8hw6ASnziZZIajyjD9Aq9dwdXBdXBj4CDsc+Jltsda2415B8C6RjA1Tx8g== # pragma: allowlist secret
