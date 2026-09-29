@@ -28,7 +28,7 @@ The ETL output will target towards the TSA (Transient Staging Area) layer of the
 | Job script | [job/spreadsheet_google_lims.py](job/spreadsheet_google_lims.py) |
 | Target table | `orcavault.tsa.spreadsheet__google_lims` |
 | Source worksheet | `Sheet1` |
-| Schedule (prod) | `cron(10 13 * * ? *)` — 00:10 AEST/AEDT |
+| Schedule (prod) | `cron(10 13 * * ? *)` — 23:10 AEST |
 
 Datasource credentials are read at runtime from SSM Parameter Store. These parameters are **not**
 stage-scoped, so dev and prod read the same spreadsheet.

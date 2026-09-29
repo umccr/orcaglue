@@ -7,9 +7,9 @@ config:
   spreadsheet-library-tracking-metadata:lz-bucket: orcahouse-prod-landing-zone-115253169271-ap-southeast-2-an
   spreadsheet-library-tracking-metadata:rs-workgroup: orcahouse-prod
   spreadsheet-library-tracking-metadata:rs-role: arn:aws:iam::115253169271:role/prod-redshift-namespace-role
-  # Keep the trigger off until a manual prod run has been validated.
-  spreadsheet-library-tracking-metadata:trigger-enabled: "false"
-  # 13:25 UTC = AEST/AEDT 00:25 AM. Staggered against the other ETL modules.
+  # Scheduled trigger enabled in prod after the manual run was validated.
+  spreadsheet-library-tracking-metadata:trigger-enabled: "true"
+  # 13:25 UTC = 23:25 AEST (Sydney/Melbourne, UTC+10). Staggered against the other ETL modules.
   spreadsheet-library-tracking-metadata:schedule: cron(25 13 * * ? *)
 # KMS-encrypted key material (not a plaintext secret); committed so the stack is decryptable by anyone with KMS access.
 secretsprovider: awskms://alias/pulumi-state-key # pragma: allowlist secret

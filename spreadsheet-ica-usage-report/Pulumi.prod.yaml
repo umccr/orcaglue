@@ -10,9 +10,9 @@ config:
   # This is the source data prefix used by the legacy OrcaHouse job.
   # Change it only if the ICA reports are copied to a new prefix.
   spreadsheet-ica-usage-report:source-prefix: ica-usage-reports/
-  # Keep the trigger off until a manual prod run has been validated.
-  spreadsheet-ica-usage-report:trigger-enabled: "false"
-  # 13:40 UTC = AEST/AEDT 00:40 AM. Staggered behind the other ETL modules.
+  # Scheduled trigger enabled in prod after the manual run was validated.
+  spreadsheet-ica-usage-report:trigger-enabled: "true"
+  # 13:40 UTC = 23:40 AEST (Sydney/Melbourne, UTC+10). Staggered behind the other ETL modules.
   spreadsheet-ica-usage-report:schedule: cron(40 13 * * ? *)
 # KMS-encrypted key material (not a plaintext secret); committed so the stack is decryptable by anyone with KMS access.
 secretsprovider: awskms://alias/pulumi-state-key # pragma: allowlist secret

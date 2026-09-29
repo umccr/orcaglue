@@ -67,7 +67,7 @@ the Pulumi project name, i.e. `<project-name>:<key>`.
 | `rs-workgroup` | Redshift Serverless workgroup targeted by the Data API |
 | `rs-role` | IAM role ARN Redshift assumes for `COPY` from S3 |
 | `trigger-enabled` | Opt-in switch for the scheduled trigger. Defaults to `false` |
-| `schedule` | Cron for the trigger. Defaults to `cron(10 13 * * ? *)` |
+| `schedule` | Cron (UTC) for the trigger. Defaults to `cron(10 13 * * ? *)` — 23:10 AEST |
 
 Stage values:
 
@@ -223,15 +223,19 @@ Only then consider [enabling the scheduled trigger](#enable-the-scheduled-trigge
 
 ## Enable the scheduled trigger
 
-Triggers ship **disabled** in every stack so a deployment can be validated by hand first.
-Enable one module at a time, and keep the schedules staggered so the jobs do not contend on the
-same Redshift workgroup.
+Triggers ship **disabled in new stacks** so a deployment can be validated by hand first. The
+existing `spreadsheet-library-tracking-metadata` dev stack is an intentional exception because its
+trigger is already live. Enable one module at a time, and keep the schedules staggered so the jobs
+do not contend on the same Redshift workgroup.
 
-| Module | Schedule (UTC) | Local (AEST/AEDT) |
+Glue cron triggers run in UTC only; the AEST column is the equivalent Sydney/Melbourne local time
+(UTC+10).
+
+| Module | Schedule (UTC) | AEST (UTC+10) |
 |---|---|---|
-| `spreadsheet-google-lims` | `cron(10 13 * * ? *)` | 00:10 |
-| `spreadsheet-library-tracking-metadata` | `cron(25 13 * * ? *)` | 00:25 |
-| `spreadsheet-ica-usage-report` | `cron(40 13 * * ? *)` | 00:40 |
+| `spreadsheet-google-lims` | `cron(10 13 * * ? *)` | 23:10 |
+| `spreadsheet-library-tracking-metadata` | `cron(25 13 * * ? *)` | 23:25 |
+| `spreadsheet-ica-usage-report` | `cron(40 13 * * ? *)` | 23:40 |
 
 ```
 pulumi config set <project-name>:trigger-enabled true

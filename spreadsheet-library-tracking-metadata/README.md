@@ -36,7 +36,7 @@ The strategy is not to solve with one-shot of a silver bullet. We are solving th
 | Job script | [job/spreadsheet_library_tracking_metadata.py](job/spreadsheet_library_tracking_metadata.py) |
 | Target table | `orcavault.tsa.spreadsheet__library_tracking_metadata` |
 | Source worksheets | one per year, `2017` through `2026` |
-| Schedule (prod) | `cron(25 13 * * ? *)` — 00:25 AEST/AEDT |
+| Schedule (prod) | `cron(25 13 * * ? *)` — 23:25 AEST |
 
 The job reads one worksheet per year and concatenates them, adding the sheet name as a column. A
 new year means adding it to the `SHEETS` list in the job script.
@@ -65,7 +65,7 @@ The prod trigger ships disabled. Validate a manual run first, then see
 ## Scheduled trigger in dev
 
 Unlike the other ETL modules, this one also runs on a schedule in **dev**, daily at 13:10 UTC
-(00:10 AEST/AEDT). The trigger was originally armed out of band, so `trigger-enabled: "true"` is
+(23:10 AEST). The trigger was originally armed out of band, so `trigger-enabled: "true"` is
 declared in [Pulumi.dev.yaml](Pulumi.dev.yaml) to keep the config honest about the live state.
 
 Confirm the actual state in AWS rather than trusting Pulumi state alone, because a trigger armed

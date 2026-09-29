@@ -118,8 +118,8 @@ glue_trigger = aws.glue.Trigger(
         lambda name: f"{name}-scheduled-trigger"
     ),
     type="SCHEDULED",
-    # Default is 13:10 UTC = AEST/AEDT 00:10 AM. Override per stack via the
-    # "schedule" config key to stagger against the other ETL modules.
+    # Default is 13:10 UTC = 23:10 AEST (Sydney/Melbourne, UTC+10). Override per
+    # stack via the "schedule" config key to stagger against the other ETL modules.
     schedule=schedule,
     description=pulumi.Output.from_input(glue_job.name).apply(
         lambda name: f"Daily trigger for {name}"

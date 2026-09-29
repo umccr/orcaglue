@@ -9,7 +9,7 @@ config:
   spreadsheet-google-lims:rs-role: arn:aws:iam::115253169271:role/prod-redshift-namespace-role
   # Keep the trigger off until a manual prod run has been validated.
   spreadsheet-google-lims:trigger-enabled: "false"
-  # 13:10 UTC = AEST/AEDT 00:10 AM. Staggered against the other ETL modules.
+  # 13:10 UTC = 23:10 AEST (Sydney/Melbourne, UTC+10). Staggered against the other ETL modules.
   spreadsheet-google-lims:schedule: cron(10 13 * * ? *)
 # KMS-encrypted key material (not a plaintext secret); committed so the stack is decryptable by anyone with KMS access.
 secretsprovider: awskms://alias/pulumi-state-key # pragma: allowlist secret

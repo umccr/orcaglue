@@ -46,7 +46,7 @@ Then fill in the sections below, remove this one, and update the description abo
 | Glue job | `orcaglue-<stage>-sample-job-job` <!-- FIXME --> |
 | Job script | [job/sample.py](job/sample.py) <!-- FIXME --> |
 | Target table | `orcavault.tsa.demo__sample_data` <!-- FIXME --> |
-| Schedule (prod) | `cron(10 13 * * ? *)` <!-- FIXME stagger against the other modules --> |
+| Schedule (prod) | `cron(10 13 * * ? *)` — 23:10 AEST <!-- FIXME stagger against the other modules --> |
 
 Stack config lives in [Pulumi.dev.yaml](Pulumi.dev.yaml). See
 [Stack Configuration](../README_DEPLOY.md#stack-configuration) for what each key means.

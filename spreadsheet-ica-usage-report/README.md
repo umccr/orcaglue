@@ -103,7 +103,7 @@ Module-specific config, in [Pulumi.dev.yaml](Pulumi.dev.yaml) and [Pulumi.prod.y
 |---|---|---|
 | `source-prefix` | `ica-usage-reports/` | S3 prefix holding the raw ICA report CSV files |
 | `trigger-enabled` | `"false"` | Schedule stays off until a manual run is validated |
-| `schedule` | `cron(40 13 * * ? *)` | 00:40 AEST/AEDT, staggered behind the other modules |
+| `schedule` | `cron(40 13 * * ? *)` | 23:40 AEST, staggered behind the other modules |
 
 Other keys are the shared ones described in
 [Stack Configuration](../README_DEPLOY.md#stack-configuration).
