@@ -18,6 +18,8 @@ lz_bucket = config.require("lz-bucket")
 rs_workgroup = config.require("rs-workgroup")
 rs_role = config.require("rs-role")
 shared_infra_path = config.require("shared-infra")
+schedule = config.get("schedule") or "cron(10 13 * * ? *)"
+trigger_enabled = config.get_bool("trigger-enabled")
 
 shared_infra_ref = pulumi.StackReference(shared_infra_path)
 shared_glue_role_arn = shared_infra_ref.get_output("shared_glue_role_arn")
@@ -98,6 +100,7 @@ glue_job = aws.glue.Job(
             "--rs_role": rs_role,
             "--base_name": base_name,
             "--s3_mid_path": s3_mid_path,
+            "--dry_run": "false",
         }
     ),
 )
@@ -106,8 +109,8 @@ pulumi.export("glue_job_name", glue_job.name)
 
 # --- Glue Trigger ---
 
-# Only enable in prod
-enable_trigger = stack_stage == "prod"
+# Keep triggers opt-in so prod can be validated manually before scheduling.
+enable_trigger = trigger_enabled if trigger_enabled is not None else False
 
 glue_trigger = aws.glue.Trigger(
     "glue-trigger",
@@ -115,7 +118,9 @@ glue_trigger = aws.glue.Trigger(
         lambda name: f"{name}-scheduled-trigger"
     ),
     type="SCHEDULED",
-    schedule="cron(10 13 * * ? *)",  # Daily at 13:10 UTC = AEST/AEDT 00:10 AM
+    # Default is 13:10 UTC = 23:10 AEST (Sydney/Melbourne, UTC+10). Override per
+    # stack via the "schedule" config key to stagger against the other ETL modules.
+    schedule=schedule,
     description=pulumi.Output.from_input(glue_job.name).apply(
         lambda name: f"Daily trigger for {name}"
     ),
@@ -129,3 +134,4 @@ glue_trigger = aws.glue.Trigger(
 )
 
 pulumi.export("glue_trigger_name", glue_trigger.name)
+pulumi.export("glue_trigger_enabled", enable_trigger)

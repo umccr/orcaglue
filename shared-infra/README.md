@@ -1,6 +1,12 @@
 # OrcaGlue Shared Infrastructure
 
-The shared AWS resources for the Glue ETL pipelines.
+The shared AWS resources for the Glue ETL pipelines — the Glue execution role, its inline policy,
+the `tsa` schema and the role grants on it.
+
+This stack is **step 1 of the [Deploy Process](../README_DEPLOY.md#deploy-process)** and must be
+applied before any ETL module stack, because every module reads its `shared_glue_role_arn` output
+and the modules do not own the `tsa` schema. The [Refresh Grant Glue Role](#refresh-grant-glue-role)
+section below is step 3 of that process.
 
 NOTE: 
 Required **admin privilege** for creating IAM roles.

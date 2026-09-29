@@ -3,6 +3,7 @@
 <!-- TOC -->
 * [Local Development](#local-development)
   * [Steps](#steps)
+  * [Run a Module](#run-a-module)
   * [Undo AWS](#undo-aws)
 <!-- TOC -->
 
@@ -87,6 +88,50 @@ spark-submit sample.py
 
 pytest -s
 ```
+
+## Run a Module
+
+The loop below is the same for every ETL module. Replace `<module>` with the module directory,
+e.g. `spreadsheet-google-lims`.
+
+Authenticate the AWS session and use `granted` to export temporary credentials.
+```
+export AWS_PROFILE=unimelb-warehouse-prod-poweruser
+aws sso login
+assume
+env | grep AWS
+```
+
+Change to the module root and bring up the local Glue stack.
+```
+cd <module>
+make up
+make ps
+```
+
+_If the container was created before you assumed the role, or the credentials were refreshed,
+run `make reload` before `make glue`._
+
+Enter the Glue container, then change to the module root inside it as well.
+```
+make glue
+cd workspace/<module>/
+```
+
+Check your AWS access, then run the ETL.
+```
+make debug
+make run
+```
+
+To extract and transform without touching Redshift, use dry-run mode. It still uploads the
+generated CSV and SQL artefacts to S3, then stops before the `TRUNCATE` and `COPY`.
+```
+make run-dry
+```
+
+All local `make run` targets point at **dev** resources. See
+[README_DEPLOY.md](README_DEPLOY.md) for the deployed job equivalents.
 
 ## Undo AWS
 
