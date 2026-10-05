@@ -9,6 +9,7 @@
   * [Dev Deployment](#dev-deployment)
   * [Production Deployment](#production-deployment)
   * [Enable the scheduled trigger](#enable-the-scheduled-trigger)
+  * [Failure Notifications](#failure-notifications)
   * [Dry Run](#dry-run)
   * [Verifying a Deployment](#verifying-a-deployment)
   * [Teardown](#teardown)
@@ -256,6 +257,16 @@ otherwise the next `pulumi up` re-arms it.
 > A trigger armed or stopped out of band with the AWS CLI is invisible to `pulumi preview`
 > without a refresh, so Pulumi state is not proof of the live state. Always confirm with
 > `aws glue get-trigger`.
+
+## Failure Notifications
+
+Failed and timed-out Glue runs post to Slack through an EventBridge rule owned by the
+`shared-infra` stack. Each stage has one rule covering every module, including new ones. The rule
+ships disabled, like the triggers. Roll it out and test it in `dev` first. Prod schedules already
+run unattended, so enable prod as soon as the dev test passes.
+
+See [Glue Job Failure Notifications](shared-infra/README.md#glue-job-failure-notifications) for the
+rollout order, the SNS topic policy and troubleshooting.
 
 ## Dry Run
 
