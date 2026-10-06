@@ -9,11 +9,25 @@ register_global_tags()
 db_name = "orcavault"
 stack_prefix = "orcaglue"
 stack_stage = pulumi.get_stack()  # dev or prod
+# The AWS account both stacks deploy into (115253169271). Shown in the Slack alerts,
+# because several accounts post to the same alert channels.
+account_name = "umccr-warehouse-prod"
 
 config = pulumi.Config()
 
 lz_bucket = config.require("lz-bucket")
 rs_workgroup_name = config.require("rs-workgroup")
+
+# Glue job failure notifications (section 7). Opt-in like the module triggers: the rule
+# ships DISABLED until "notify-enabled" is set to true. Leaving "notify-topic-arn" unset
+# creates no notification resources at all; it becomes required once enabled.
+notify_enabled = config.get_bool("notify-enabled")
+enable_notify = notify_enabled if notify_enabled is not None else False
+notify_topic_arn = (
+    config.require("notify-topic-arn")
+    if enable_notify
+    else config.get("notify-topic-arn")
+)
 
 # --- Look up pre-existing resources ---
 
@@ -165,3 +179,141 @@ glue_role_redshift_grants = aws.redshiftdata.Statement(
 # --- 6. Export role ARN for cross-stack reference ---
 
 pulumi.export("shared_glue_role_arn", shared_glue_role.arn)
+
+# --- 7. Glue job failure notifications ---
+
+# Glue publishes a "Glue Job State Change" event to this account's default EventBridge
+# bus when a job run ends. The rule below matches failed and timed-out runs of this
+# stage's jobs and delivers them directly to the Slack-bound SNS topic, which lives in
+# another account. 
+#
+# The topic owner must allow the notify role to publish. The policy statement and the
+# rollout order are in shared-infra/README.md#glue-job-failure-notifications.
+
+if notify_topic_arn:
+    account_id = aws.get_caller_identity().account_id
+    notify_job_prefix = f"{stack_prefix}-{stack_stage}-"
+    # Glue emits this event for SUCCEEDED, FAILED, TIMEOUT and STOPPED only. STOPPED is a
+    # manual cancel and is left out on purpose; add it here if it should notify too.
+    notify_states = ["FAILED", "TIMEOUT"]
+
+    glue_failure_rule = aws.cloudwatch.EventRule(
+        f"{stack_prefix}-shared-infra-glue-job-failure-rule-{stack_stage}",
+        name=f"{stack_prefix}-shared-infra-glue-job-failure-rule-{stack_stage}",
+        description=(
+            f"Send {' and '.join(notify_states)} runs of {notify_job_prefix}* "
+            "Glue jobs to the Slack SNS topic"
+        ),
+        event_bus_name="default",
+        event_pattern=json.dumps(
+            {
+                "source": ["aws.glue"],
+                "detail-type": ["Glue Job State Change"],
+                "detail": {
+                    "jobName": [{"prefix": notify_job_prefix}],
+                    "state": notify_states,
+                },
+            }
+        ),
+        state="ENABLED" if enable_notify else "DISABLED",
+    )
+
+    # EventBridge assumes this role to publish to the topic in the other account. The
+    # trust is scoped to this rule only, to prevent the confused deputy problem.
+    glue_notify_role = aws.iam.Role(
+        f"{stack_prefix}-shared-infra-glue-notify-role-{stack_stage}",
+        name=f"{stack_prefix}-shared-infra-glue-notify-role-{stack_stage}",
+        description=(
+            "Assumed by EventBridge to publish failed Glue job runs "
+            "to the Slack SNS topic"
+        ),
+        assume_role_policy=glue_failure_rule.arn.apply(
+            lambda rule_arn: json.dumps(
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Action": "sts:AssumeRole",
+                            "Effect": "Allow",
+                            "Principal": {"Service": "events.amazonaws.com"},
+                            "Condition": {
+                                "StringEquals": {"aws:SourceAccount": account_id},
+                                "ArnEquals": {"aws:SourceArn": rule_arn},
+                            },
+                        }
+                    ],
+                }
+            )
+        ),
+    )
+
+    glue_notify_role_policy = aws.iam.RolePolicy(
+        f"{stack_prefix}-shared-infra-glue-notify-role-inline-policy-{stack_stage}",
+        role=glue_notify_role.id,
+        policy=json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "PublishToSlackTopic",
+                        "Effect": "Allow",
+                        "Action": "sns:Publish",
+                        "Resource": notify_topic_arn,
+                    }
+                ],
+            }
+        ),
+    )
+
+    # Amazon Q Developer in chat apps (the topic's Slack integration) does not render raw
+    # Glue events, so the event is reshaped into its custom notification schema.
+    #
+    # The Glue error message (detail.message) is left out on purpose. EventBridge does
+    # not escape the values it substitutes into the template, so an error containing a
+    # double quote or a newline (common in Redshift errors) would produce invalid JSON
+    # and Amazon Q would drop the notification. The run link shows the full error.
+    slack_notification = {
+        "version": "1.0",
+        "source": "custom",
+        "content": {
+            "textType": "client-markdown",
+            "title": ":rotating_light: Glue job <state>: <jobName>",
+            "description": (
+                "*Run ID:* `<jobRunId>`\n"
+                f"*Account:* {account_name} (<account>, <region>)\n"
+                "*Time:* <time>"
+            ),
+            "nextSteps": [
+                (
+                    "Error and logs: https://<region>.console.aws.amazon.com/gluestudio"
+                    "/home?region=<region>#/job/<jobName>/run/<jobRunId>"
+                ),
+            ],
+            "keywords": ["OrcaGlue", stack_stage, "<state>"],
+        },
+    }
+
+    aws.cloudwatch.EventTarget(
+        f"{stack_prefix}-shared-infra-glue-job-failure-target-{stack_stage}",
+        rule=glue_failure_rule.name,
+        event_bus_name="default",
+        target_id="slack-sns-topic",
+        arn=notify_topic_arn,
+        role_arn=glue_notify_role.arn,
+        input_transformer=aws.cloudwatch.EventTargetInputTransformerArgs(
+            input_paths={
+                "account": "$.account",
+                "region": "$.region",
+                "time": "$.time",
+                "jobName": "$.detail.jobName",
+                "jobRunId": "$.detail.jobRunId",
+                "state": "$.detail.state",
+            },
+            input_template=json.dumps(slack_notification),
+        ),
+        opts=pulumi.ResourceOptions(depends_on=[glue_notify_role_policy]),
+    )
+
+    pulumi.export("glue_notify_role_arn", glue_notify_role.arn)
+    pulumi.export("glue_failure_rule_name", glue_failure_rule.name)
+    pulumi.export("glue_failure_rule_state", glue_failure_rule.state)
