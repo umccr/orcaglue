@@ -77,158 +77,63 @@ TO "IAMR:orcaglue-shared-infra-glue-job-role-dev";
 
 ## Glue Job Failure Notifications
 
-Failed and timed-out runs of this stage's Glue jobs (`orcaglue-<stage>-*`) are posted to Slack.
-Glue publishes a `Glue Job State Change` event to this account's default EventBridge bus, and a
-rule delivers matching runs straight to the stage's Slack-bound SNS topic in another account. No
-event bus or code is needed on the receiving side.
+Failed and timed-out runs of this stage's Glue jobs (`orcaglue-<stage>-*`) post to Slack. Glue
+publishes a `Glue Job State Change` event to the default EventBridge bus, and a rule sends matching
+runs straight to the stage's SNS topic in another account, where Amazon Q Developer posts them to
+Slack.
 
 ```
 Glue job run → default event bus (115253169271) → EventBridge rule → stage's SNS topic → Amazon Q → Slack
 ```
 
-| Stage | Topic (`notify-topic-arn`) | Topic account | Slack channel |
-|---|---|---|---|
-| `dev` | `arn:aws:sns:ap-southeast-2:843407916570:AwsChatBotTopic-alerts` | umccr-development (`843407916570`) | `alerts-dev` |
-| `prod` | `arn:aws:sns:ap-southeast-2:472057503814:AwsChatBotTopic-alerts` | `472057503814` | `alerts-prod` |
+| Stage | Topic (`notify-topic-arn`) | Slack channel |
+|---|---|---|
+| `dev` | `arn:aws:sns:ap-southeast-2:843407916570:AwsChatBotTopic-alerts` | `alerts-dev` |
+| `prod` | `arn:aws:sns:ap-southeast-2:472057503814:AwsChatBotTopic-alerts` | `alerts-prod` |
 
-Both topic accounts are in a different AWS organisation from `115253169271`. That is fine: the
-notify role and the topic policy are all the access needs.
+When `notify-topic-arn` is set, the stack creates a rule matching `FAILED` and `TIMEOUT`
+(`orcaglue-shared-infra-glue-job-failure-rule-<stage>`), a role EventBridge assumes to publish to
+the topic (`orcaglue-shared-infra-glue-notify-role-<stage>`), and a target that formats the Slack
+message. `notify-enabled` sets the rule state and defaults to `false`.
 
-The stack creates these only when `notify-topic-arn` is set. Each stage gets its own rule and role:
+The message shows the job, state, run ID, account (`umccr-warehouse-prod`), time and a link to the
+run. It leaves out the Glue error message: EventBridge doesn't escape it, so an error containing a
+quote would break the message. The link shows the full error.
 
-* Rule `orcaglue-shared-infra-glue-job-failure-rule-<stage>` on the default bus, matching `FAILED`
-  and `TIMEOUT`.
-* Role `orcaglue-shared-infra-glue-notify-role-<stage>`, which EventBridge assumes to call
-  `sns:Publish` on the topic. Its trust is scoped to the rule.
-* A target that reshapes the event into an Amazon Q Developer custom notification: job, state, run
-  ID, account name and ID, time and a link to the run. Several accounts post to the same alert
-  channels, so the account name (`account_name` in `__main__.py`, `umccr-warehouse-prod`) shows
-  where an alert came from.
-
-The Glue error message is deliberately left out of the Slack message. EventBridge does not escape
-the values it puts into the message template, so an error containing a double quote or a newline
-(common in Redshift errors) would produce invalid JSON, and Amazon Q would drop the notification.
-The run link shows the full error.
-
-| Key | Purpose |
-|---|---|
-| `notify-topic-arn` | SNS topic to publish to. Unset means the stack creates no notification resources |
-| `notify-enabled` | Rule state. Defaults to `false`, so the rule is created `DISABLED`. Requires `notify-topic-arn` |
+The topic accounts are in a different AWS organisation. That's fine: the role and the topic policy
+are all the access needs.
 
 ### Rollout
 
-Roll out to `dev` first and test there, then repeat the same steps for `prod`. Within a stage the
-order is fixed: the topic policy names that stage's notify role, and the role must exist before
-the topic owner can add it.
+Do `dev` first, then `prod`. Within a stage the order matters, because the topic policy names the
+stage's role and the role has to exist first.
 
-Set the stage once per shell, `dev` first and `prod` later:
-```
-STAGE=dev
-```
+1. **Deploy.** As admin in `115253169271`, run `pulumi up` on the stage (see above). It adds four
+   resources, with the rule disabled.
+2. **Allow the role to publish.** In the topic's account, open SNS → Topics →
+   `AwsChatBotTopic-alerts` → Edit → Access policy, and add the stage's statement
+   ([dev](policy/AwsChatBotTopic-policy-statement-dev.json), [prod](policy/AwsChatBotTopic-policy-statement-prod.json)) to the existing ones. Don't replace the policy. The topic must not be encrypted 
+   with the AWS managed `aws/sns` key, which blocks publishing from another account.
+3. **Enable.** Run `pulumi config set shared-infra:notify-enabled true` and `pulumi up`, then commit
+   `Pulumi.<stage>.yaml`.
+4. **Test.** Force a failure, then check the stage's Slack channel:
+   ```
+   aws glue start-job-run --job-name orcaglue-<stage>-spreadsheet-google-lims-job --arguments '{"--rs_workgroup":"does-not-exist"}'
+   ```
+   The made-up workgroup makes the job fail before `TRUNCATE`, so no table is touched. The message
+   should arrive within a minute or two.
 
-**1. Create the rule and role.** As admin in `umccr-warehouse-prod` (`115253169271`). The rule
-ships disabled.
-```
-cd shared-infra
-pulumi stack select $STAGE
-pulumi preview
-pulumi up
-pulumi stack output glue_notify_role_arn
-```
-The preview should only add four resources: the rule, the role, its inline policy and the target.
-
-**2. Allow the role to publish.** Authenticated to the stage's topic account (see the table above),
-merge the stage's statement into the topic's access policy:
-[`dev`](policy/AwsChatBotTopic-policy-statement-dev.json) or
-[`prod`](policy/AwsChatBotTopic-policy-statement-prod.json). Its principal must match the
-`glue_notify_role_arn` output, and its resource must be the stage's topic.
-
-> Merge the statement; do not replace the policy. The existing statements let that account's own
-> services, such as other alert rules, publish to the topic.
-
-In the console: SNS → Topics → `AwsChatBotTopic-alerts` → Edit → Access policy. Append the statement to
-the `Statement` array and save.
-
-Or with the CLI, from the repository root. The original policy stays in
-`/tmp/topic-policy-before-$STAGE.json` for rollback, and re-running replaces the statement rather
-than duplicating it.
-```
-case $STAGE in dev) TOPIC_ARN=arn:aws:sns:ap-southeast-2:843407916570:AwsChatBotTopic-alerts ;; prod) TOPIC_ARN=arn:aws:sns:ap-southeast-2:472057503814:AwsChatBotTopic-alerts ;; esac
-aws sns get-topic-attributes --topic-arn "$TOPIC_ARN" --query Attributes.Policy --output text > /tmp/topic-policy-before-$STAGE.json
-jq --slurpfile s shared-infra/policy/AwsChatBotTopic-policy-statement-$STAGE.json \
-  '.Statement |= ((if type == "array" then . else [.] end) | map(select(.Sid != $s[0].Sid)) + $s)' \
-  /tmp/topic-policy-before-$STAGE.json > /tmp/topic-policy-merged.json
-aws sns set-topic-attributes --topic-arn "$TOPIC_ARN" --attribute-name Policy \
-  --attribute-value file:///tmp/topic-policy-merged.json
-```
-
-Check the topic's encryption as well:
-```
-aws sns get-topic-attributes --topic-arn "$TOPIC_ARN" --query Attributes.KmsMasterKeyId --output text
-```
-`None` means nothing more is needed. The AWS managed key `alias/aws/sns` blocks publishing from
-another account. In that case the topic needs a customer managed key whose key policy allows the
-notify role, and the role needs `kms:GenerateDataKey*` and `kms:Decrypt` added in `__main__.py`.
-
-**3. Enable the rule.** Back in `115253169271`:
-```
-pulumi config set shared-infra:notify-enabled true
-pulumi preview
-pulumi up
-aws events describe-rule --name orcaglue-shared-infra-glue-job-failure-rule-$STAGE --query State
-```
-The preview should show one update, the rule's state. `ENABLED` means live. `pulumi config set`
-edits `Pulumi.$STAGE.yaml`; commit it so the repository matches the live state. Like the triggers,
-a rule changed with the CLI is invisible to Pulumi without a refresh, so confirm the live state
-with `describe-rule`.
-
-**4. Test with a forced failure.** `spreadsheet-google-lims` has no live schedule in either stage,
-so a manual run cannot clash with one. Overriding the workgroup makes the job fail on its first
-Redshift Data API call, before `TRUNCATE`. The run still uploads its artefacts to S3, which is
-harmless.
-```
-aws glue start-job-run --job-name orcaglue-$STAGE-spreadsheet-google-lims-job \
-  --arguments '{"--rs_workgroup":"does-not-exist"}'
-```
-A Slack message should arrive within about a minute of the run failing. Check that its link opens
-the failed run.
-
-Dev failures post to the same Slack channel as prod. After the dev test, either keep dev enabled
-or set its `notify-enabled` back to `false`.
-
-To stop notifications quickly, run
-`aws events disable-rule --name orcaglue-shared-infra-glue-job-failure-rule-$STAGE`, then persist
-it with `pulumi config set shared-infra:notify-enabled false && pulumi up`.
+To stop alerts quickly, run `aws events disable-rule --name orcaglue-shared-infra-glue-job-failure-rule-<stage>`.
+Then set `notify-enabled` to `false` and run `pulumi up`, or the next deploy turns it back on.
 
 ### Troubleshooting
 
-If no message arrives, check the rule's metrics in CloudWatch (namespace `AWS/Events`, dimension
-`RuleName`). They land a few minutes after the run ends, so wait about five minutes before reading
-them, or a real match reads as zero. The `date` syntax below is the macOS one.
-```
-RULE=orcaglue-shared-infra-glue-job-failure-rule-$STAGE
-for m in MatchedEvents SuccessfulInvocationAttempts RetryInvocationAttempts FailedInvocations; do
-  echo "$m: $(aws cloudwatch get-metric-statistics --namespace AWS/Events --metric-name "$m" \
-    --dimensions Name=RuleName,Value="$RULE" --statistics Sum --period 60 \
-    --start-time "$(date -u -v-3H +%Y-%m-%dT%H:%M:%SZ)" --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --query 'sum(Datapoints[].Sum)' --output text)"
-done
-```
+Check the rule's CloudWatch metrics (namespace `AWS/Events`, by `RuleName`). They arrive a few
+minutes late, so wait about five minutes after the run.
 
-* `MatchedEvents` is zero: the event did not match. Confirm the rule is `ENABLED` and the job name
+* **`MatchedEvents` is 0:** the event didn't match. Check the rule is enabled and the job name
   starts with `orcaglue-<stage>-`.
-* `FailedInvocations` or `RetryInvocationAttempts` is above zero: EventBridge could not publish. A
-  permission error is not retried, so it shows as `FailedInvocations` alone. To see which side
-  refused it, check CloudTrail in `115253169271`:
-  ```
-  aws cloudtrail lookup-events --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRole --max-results 50 --output json \
-    | jq -r '.Events[].CloudTrailEvent | fromjson | select((.requestParameters.roleArn // "") | test("glue-notify-role")) | [.eventTime, (.errorCode // "ok")] | @tsv'
-  ```
-  If EventBridge assumed the notify role (`ok`), the topic refused the publish. Check that the
-  target is the topic carrying the statement, that the statement names this stage's role, and the
-  topic's encryption. The two accounts are in different organisations, so an organisation policy
-  on either side could also block it.
-* `SuccessfulInvocationAttempts` is above zero but nothing reached Slack: Amazon Q dropped the
-  message. Check the channel configuration's logs in the stage's topic account, in CloudWatch Logs in
-  `us-east-1` under `/aws/chatbot/<configuration-name>`. Logging must be enabled on the channel
-  configuration.
+* **`FailedInvocations` is above 0:** the topic refused the publish. Check the target is the topic
+  that has the statement, and the statement names this stage's role.
+* **`SuccessfulInvocationAttempts` is above 0 but Slack is empty:** Amazon Q dropped the message.
+  Check its channel logs in the topic's account.
