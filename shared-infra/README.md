@@ -1,7 +1,8 @@
 # OrcaGlue Shared Infrastructure
 
 The shared AWS resources for the Glue ETL pipelines — the Glue execution role, its inline policy,
-the `tsa` schema and the role grants on it.
+the `tsa` schema, the role grants on it, and the
+[Slack alerts for failed Glue job runs](#glue-job-failure-notifications).
 
 This stack is **step 1 of the [Deploy Process](../README_DEPLOY.md#deploy-process)** and must be
 applied before any ETL module stack, because every module reads its `shared_glue_role_arn` output
@@ -94,7 +95,8 @@ Glue job run → default event bus (115253169271) → EventBridge rule → stage
 When `notify-topic-arn` is set, the stack creates a rule matching `FAILED` and `TIMEOUT`
 (`orcaglue-shared-infra-glue-job-failure-rule-<stage>`), a role EventBridge assumes to publish to
 the topic (`orcaglue-shared-infra-glue-notify-role-<stage>`), and a target that formats the Slack
-message. `notify-enabled` sets the rule state and defaults to `false`.
+message. `notify-enabled` sets the rule state. It defaults to `false`, and both stages set it to
+`true`.
 
 The message shows the job, state, run ID, account (`umccr-warehouse-prod`), time and a link to the
 run. It leaves out the Glue error message: EventBridge doesn't escape it, so an error containing a
@@ -105,11 +107,11 @@ are all the access needs.
 
 ### Rollout
 
-Do `dev` first, then `prod`. Within a stage the order matters, because the topic policy names the
-stage's role and the role has to exist first.
+To set up a stage, do these in order. The topic policy names the stage's role, so the role has to
+exist first.
 
-1. **Deploy.** As admin in `115253169271`, run `pulumi up` on the stage (see above). It adds four
-   resources, with the rule disabled.
+1. **Deploy.** As admin in `115253169271`, run `pulumi up` on the stage with `notify-enabled` still
+   `false` (see above). It adds four resources, with the rule disabled.
 2. **Allow the role to publish.** In the topic's account, open SNS → Topics →
    `AwsChatBotTopic-alerts` → Edit → Access policy, and add the stage's statement
    ([dev](policy/AwsChatBotTopic-policy-statement-dev.json), [prod](policy/AwsChatBotTopic-policy-statement-prod.json)) to the existing ones. Don't replace the policy. The topic must not be encrypted 

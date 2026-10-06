@@ -261,9 +261,9 @@ otherwise the next `pulumi up` re-arms it.
 ## Failure Notifications
 
 Failed and timed-out Glue runs post to Slack through an EventBridge rule owned by the
-`shared-infra` stack. Each stage has one rule covering every module, including new ones. The rule
-ships disabled, like the triggers. Roll it out and test it in `dev` first. Prod schedules already
-run unattended, so enable prod as soon as the dev test passes.
+`shared-infra` stack. Each stage has one rule covering every module, including new ones. Both
+stages have it enabled: dev posts to `alerts-dev` and prod to `alerts-prod`. Like the triggers,
+`notify-enabled` defaults to `false`, so a new stack's rule starts disabled.
 
 See [Glue Job Failure Notifications](shared-infra/README.md#glue-job-failure-notifications) for the
 rollout order, the SNS topic policy and troubleshooting.

@@ -8,5 +8,5 @@ config:
   # SNS topic in 472057503814 behind the alerts-prod Slack channel. Failed and timed-out
   # orcaglue-prod-* Glue job runs are delivered here. See README.md#glue-job-failure-notifications.
   shared-infra:notify-topic-arn: arn:aws:sns:ap-southeast-2:472057503814:AwsChatBotTopic-alerts
-  # Keep the rule off until the topic owner has allowed the notify role to publish.
-  shared-infra:notify-enabled: "false"
+  # Rule on. The topic's access policy must allow the prod notify role to publish.
+  shared-infra:notify-enabled: "true"
