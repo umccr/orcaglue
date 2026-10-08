@@ -74,3 +74,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE
 ON TABLES
 TO "IAMR:orcaglue-shared-infra-glue-job-role-dev";
 ```
+
+## Glue Job Failure Notifications
+
+This stack does not own failure alerts. Glue job failure notifications now live in the centralised
+[orcahouse notification stack](https://github.com/umccr/orcahouse/tree/main/infra/notification),
+which also covers DMS and crawler rules.

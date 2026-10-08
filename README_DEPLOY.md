@@ -9,6 +9,7 @@
   * [Dev Deployment](#dev-deployment)
   * [Production Deployment](#production-deployment)
   * [Enable the scheduled trigger](#enable-the-scheduled-trigger)
+  * [Failure Notifications](#failure-notifications)
   * [Dry Run](#dry-run)
   * [Verifying a Deployment](#verifying-a-deployment)
   * [Teardown](#teardown)
@@ -256,6 +257,12 @@ otherwise the next `pulumi up` re-arms it.
 > A trigger armed or stopped out of band with the AWS CLI is invisible to `pulumi preview`
 > without a refresh, so Pulumi state is not proof of the live state. Always confirm with
 > `aws glue get-trigger`.
+
+## Failure Notifications
+
+Glue job failure alerts are not deployed from this repo. They live in the centralised
+[orcahouse notification stack](https://github.com/umccr/orcahouse/tree/main/infra/notification),
+which also covers DMS and crawler rules.
 
 ## Dry Run
 
