@@ -1,9 +1,0 @@
-{
-  "Sid": "AllowOrcaGlueDevGlueFailureNotify",
-  "Effect": "Allow",
-  "Principal": {
-    "AWS": "arn:aws:iam::115253169271:role/orcaglue-shared-infra-glue-notify-role-dev"
-  },
-  "Action": "sns:Publish",
-  "Resource": "arn:aws:sns:ap-southeast-2:843407916570:AwsChatBotTopic-alerts"
-}
