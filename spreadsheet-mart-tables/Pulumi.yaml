@@ -1,0 +1,4 @@
+name: spreadsheet-mart-tables
+description: Reverse ETL job loading the OrcaVault mart CSV unload into Aurora PostgreSQL orcanexus
+runtime:
+  name: python

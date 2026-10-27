@@ -88,6 +88,13 @@ Both `dev` and `prod` live in the same AWS account (`115253169271`) and region
 (`ap-southeast-2`). Isolation is by bucket, workgroup, role name and stack stage only — there is
 no account boundary between them.
 
+> **`spreadsheet-mart-tables` is the exception.** It loads Aurora PostgreSQL `orcanexus-<stage>`
+> rather than Redshift, so it has no `rs-*` keys. Its own keys are in its
+> [README](spreadsheet-mart-tables/README.md#deployment). The module stack grants its own access,
+> as an extra inline policy on the shared Glue role, so `shared-infra` needs no change for it. Its
+> step 2 is the orcahouse DBA script `infra/aurora/dba/04_rw.sql`, then its `job/init.sql` run
+> against Aurora as `sadmin`, in place of the Redshift `init.sql` and grants.
+
 ## Deploy Process
 
 The same five steps apply to **every stage**. `dev` and `prod` differ only in the values used and
@@ -237,6 +244,7 @@ Glue cron triggers run in UTC only; the AEST column is the equivalent Sydney/Mel
 | `spreadsheet-google-lims` | `cron(10 13 * * ? *)` | 23:10 |
 | `spreadsheet-library-tracking-metadata` | `cron(25 13 * * ? *)` | 23:25 |
 | `spreadsheet-ica-usage-report` | `cron(40 13 * * ? *)` | 23:40 |
+| `spreadsheet-mart-tables` | `cron(0 18 * * ? *)` (placeholder, set after the Redshift UNLOAD) | 04:00 |
 
 ```
 pulumi config set <project-name>:trigger-enabled true
