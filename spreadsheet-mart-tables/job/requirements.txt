@@ -1,0 +1,10 @@
+# The job's own Python packages: the pure Python PostgreSQL driver pg8000 and its dependencies.
+# `make wheels` downloads these exact files, and Glue installs them from S3 with --no-index,
+# so a job run never reaches PyPI. Glue 5.0 already provides python-dateutil, which pg8000 needs.
+# Dependencies first, so each package's dependencies are installed before it.
+asn1crypto==1.5.1 \
+    --hash=sha256:db4e40728b728508912cbb3d44f19ce188f218e9eba635821bb4b68564f8fd67
+scramp==1.4.17 \
+    --hash=sha256:a4e3fd2e8169461a28a13777a166d3da94274454f0714a7d3023fee124474ac8
+pg8000==1.31.5 \
+    --hash=sha256:0af2c1926b153307639868d2ee5cef6cd3a7d07448e12736989b10e1d491e201

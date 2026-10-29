@@ -7,15 +7,18 @@ A Redshift UNLOAD writes each mart table as gzip CSV parts with a manifest:
 
 For every table, this job sets Content-Encoding: gzip on the parts, which the
 Aurora aws_s3 import requires and UNLOAD doesn't set, then replaces the Aurora
-table through the RDS Data API. TRUNCATE and one aws_s3.table_import_from_s3
-call per part run in one transaction per table, so a failed table keeps its
-previous rows.
+table. The job reaches the private cluster through a Glue network connection in
+its VPC, and logs in over TLS with an IAM auth token. TRUNCATE and one
+aws_s3.table_import_from_s3 call per part run in one transaction per table, so
+a failed table keeps its previous rows.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import re
+import ssl
 import sys
 import time
 from collections.abc import Callable
@@ -25,12 +28,23 @@ from typing import Any
 
 try:
     import boto3
-    from botocore.config import Config
     from botocore.exceptions import BotoCoreError, ClientError
 except ModuleNotFoundError:  # pragma: no cover
     boto3 = None
-    Config = None
     BotoCoreError = ClientError = Exception
+
+try:
+    import pg8000.native as pg8000_native
+    from pg8000.exceptions import DatabaseError, InterfaceError
+except ModuleNotFoundError:  # pragma: no cover - Glue installs it from the job's wheels
+    pg8000_native = None
+
+    class DatabaseError(Exception):
+        """Stands in for the pg8000 error where pg8000 isn't installed, as in unit tests."""
+
+    class InterfaceError(Exception):
+        """Stands in for the pg8000 error where pg8000 isn't installed, as in unit tests."""
+
 
 try:
     from awsglue.context import GlueContext
@@ -65,7 +79,10 @@ BASE_NAME_DEFAULT = "spreadsheet__mart_tables"
 S3_MID_PATH_DEFAULT = f"orcaglue/{BASE_NAME_DEFAULT}/dev"
 SCHEMA_NAME = "mart"
 DB_NAME_DEFAULT = "orcanexus"
+DB_USER_DEFAULT = "dbuser_rw"
+DB_PORT_DEFAULT = 5432
 REGION_NAME = "ap-southeast-2"
+APPLICATION_NAME = "orcaglue-spreadsheet-mart-tables"
 SUMMARY_FILE_NAME = "orcanexus_mart_tables.manifest.json"
 MANIFEST_SUFFIX = "_manifest"
 
@@ -90,10 +107,14 @@ IDENTIFIER_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
 IMPORTED_ROWS_PATTERN = re.compile(r"^(\d+) rows imported")
 
 LOCK_TIMEOUT = "30s"
+# The server ends any statement that runs longer than this. The socket timeout only
+# catches a dead connection, so it must be longer.
+STATEMENT_TIMEOUT = "10min"
+SOCKET_TIMEOUT_SECONDS = 15 * 60
 WAKE_TIMEOUT_SECONDS = 180
 WAKE_INTERVAL_SECONDS = 10
-# The Data API cancels a call after 45 seconds. Warn when an import gets close.
-SLOW_IMPORT_SECONDS = 30
+# SQLSTATE cannot_connect_now: the server is starting up, as when Aurora resumes.
+STARTING_UP_SQLSTATE = "57P03"
 
 IMPORT_SQL = (
     "SELECT aws_s3.table_import_from_s3("
@@ -136,13 +157,30 @@ class TableResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class AuroraLogin:
+    host: str
+    port: int
+    user: str
+    database: str
+
+
 class LoadError(RuntimeError):
     """A table load that was rolled back."""
 
 
-# The failures that fail one table but let the others load: AWS errors, a missing
-# or malformed manifest (OSError, ValueError, KeyError), and rolled back loads.
-TABLE_ERRORS = (ClientError, BotoCoreError, LoadError, OSError, ValueError, KeyError)
+# The failures that fail one table but let the others load: AWS and database errors,
+# a missing or malformed manifest (OSError, ValueError, KeyError), and rolled back loads.
+TABLE_ERRORS = (
+    ClientError,
+    BotoCoreError,
+    DatabaseError,
+    InterfaceError,
+    LoadError,
+    OSError,
+    ValueError,
+    KeyError,
+)
 
 
 def parse_bool(value: str | bool | None, default: bool = False) -> bool:
@@ -185,13 +223,6 @@ def get_boto3_client(service: str, config: Any = None):
     return boto3.client(service, region_name=REGION_NAME, config=config)
 
 
-def get_rds_data_client():
-    # Every call waits up to the 45 second Data API limit, and is never retried
-    # by the SDK, so a statement can't run twice.
-    config = Config(read_timeout=60, connect_timeout=10, retries={"max_attempts": 1})
-    return get_boto3_client("rds-data", config=config)
-
-
 def error_code(error: Exception) -> str | None:
     response = getattr(error, "response", None) or {}
     return response.get("Error", {}).get("Code")
@@ -208,6 +239,11 @@ def parse_s3_url(url: str) -> tuple[str, str]:
     if not bucket or not key:
         raise ValueError(f"Not an S3 object URL: {url}")
     return bucket, key
+
+
+def read_s3_text(s3: Any, url: str) -> str:
+    bucket, key = parse_s3_url(url)
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
 
 
 def read_manifest(s3: Any, bucket: str, prefix: str, table: str) -> Manifest:
@@ -288,75 +324,130 @@ def ensure_gzip_encoding(s3: Any, part: Part) -> bool:
     return True
 
 
-class DataApi:
-    """A small RDS Data API client for one database."""
+def tls_context(ca_bundle: str) -> ssl.SSLContext:
+    """Trust only the RDS CAs, and check Aurora's certificate and host name.
 
-    def __init__(self, client: Any, cluster_arn: str, secret_arn: str, database: str):
-        self.client = client
-        self.target = {"resourceArn": cluster_arn, "secretArn": secret_arn}
-        self.database = database
+    This is libpq's sslmode=verify-full. The bundle is the RDS regional CA bundle.
+    """
+    return ssl.create_default_context(cadata=ca_bundle)
+
+
+def iam_auth_token(login: AuroraLogin) -> str:
+    """A 15 minute IAM auth token, used as the password. It is signed locally."""
+    return get_boto3_client("rds").generate_db_auth_token(
+        DBHostname=login.host,
+        Port=login.port,
+        DBUsername=login.user,
+        Region=REGION_NAME,
+    )
+
+
+class Database:
+    """One PostgreSQL session on Aurora, through the pg8000 native API."""
+
+    def __init__(self, connection: Any):
+        self.connection = connection
 
     def execute(
-        self,
-        sql: str,
-        parameters: dict[str, str] | None = None,
-        transaction_id: str | None = None,
+        self, sql: str, parameters: dict[str, str] | None = None
     ) -> list[dict[str, Any]]:
         """Run one statement and return its rows as dicts."""
-        kwargs: dict[str, Any] = {
-            **self.target,
-            "database": self.database,
-            "sql": sql,
-            "formatRecordsAs": "JSON",
-        }
-        if parameters:
-            kwargs["parameters"] = [
-                {"name": name, "value": {"stringValue": value}}
-                for name, value in parameters.items()
-            ]
-        if transaction_id:
-            kwargs["transactionId"] = transaction_id
+        rows = self.connection.run(sql, **(parameters or {}))
+        names = [column["name"] for column in self.connection.columns or []]
+        return [dict(zip(names, row)) for row in rows or []]
 
-        response = self.client.execute_statement(**kwargs)
-        records = response.get("formattedRecords")
-        return json.loads(records) if records else []
+    def begin(self) -> None:
+        self.execute("BEGIN")
 
-    def begin(self) -> str:
-        response = self.client.begin_transaction(**self.target, database=self.database)
-        return response["transactionId"]
+    def commit(self) -> None:
+        self.execute("COMMIT")
 
-    def commit(self, transaction_id: str) -> None:
-        self.client.commit_transaction(**self.target, transactionId=transaction_id)
+    def rollback(self) -> None:
+        self.execute("ROLLBACK")
 
-    def rollback(self, transaction_id: str) -> None:
-        self.client.rollback_transaction(**self.target, transactionId=transaction_id)
-
-    def wake(
-        self,
-        timeout_seconds: float = WAKE_TIMEOUT_SECONDS,
-        interval_seconds: float = WAKE_INTERVAL_SECONDS,
-        sleep: Callable[[float], None] = time.sleep,
-        monotonic: Callable[[], float] = time.monotonic,
-    ) -> None:
-        """Wait for the cluster to answer. It pauses at 0 ACU and resumes on demand."""
-        deadline = monotonic() + timeout_seconds
-        while True:
-            try:
-                self.execute("SELECT 1")
-                return
-            except ClientError as error:
-                if error_code(error) != "DatabaseResumingException":
-                    raise
-                if monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"Aurora didn't resume within {timeout_seconds} seconds"
-                    ) from error
-                print("Aurora is resuming; waiting...")
-                sleep(interval_seconds)
+    def close(self) -> None:
+        try:
+            self.connection.close()
+        except (InterfaceError, OSError) as error:
+            # The server ends the session, and rolls back any open transaction, on its own.
+            print(f"WARNING: closing the Aurora connection failed: {error}")
 
 
-def table_columns(api: DataApi, table: str) -> list[str]:
-    rows = api.execute(
+def connect(
+    login: AuroraLogin,
+    ssl_context: ssl.SSLContext,
+    password: Callable[[AuroraLogin], str] = iam_auth_token,
+) -> Database:
+    """Log in to Aurora over TLS, with a new IAM auth token as the password."""
+    if pg8000_native is None:
+        raise RuntimeError("pg8000 is required; Glue installs it from the job's wheels")
+
+    connection = pg8000_native.Connection(
+        user=login.user,
+        host=login.host,
+        port=login.port,
+        database=login.database,
+        password=password(login),
+        ssl_context=ssl_context,
+        timeout=SOCKET_TIMEOUT_SECONDS,
+        application_name=APPLICATION_NAME,
+        startup_params={"statement_timeout": STATEMENT_TIMEOUT},
+    )
+    return Database(connection)
+
+
+def server_error_fields(error: Exception) -> dict[str, str]:
+    """The server's error fields on a pg8000 DatabaseError, such as C (SQLSTATE) and M."""
+    fields = error.args[0] if error.args else None
+    return fields if isinstance(fields, dict) else {}
+
+
+def sqlstate(error: Exception) -> str | None:
+    return server_error_fields(error).get("C")
+
+
+def describe_error(error: Exception) -> str:
+    """The error for the logs and the summary. A server error is its SQLSTATE and message."""
+    fields = server_error_fields(error) if isinstance(error, DatabaseError) else {}
+    if "M" in fields:
+        detail = f" ({fields['D']})" if fields.get("D") else ""
+        return f"{type(error).__name__}: {fields.get('C')} {fields['M']}{detail}"
+    return f"{type(error).__name__}: {error}"
+
+
+def wait_for_aurora(
+    connect_db: Callable[[], Database],
+    timeout_seconds: float = WAKE_TIMEOUT_SECONDS,
+    interval_seconds: float = WAKE_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """Wait until Aurora accepts a login. It pauses at 0 ACU, and a login resumes it.
+
+    Connection failures are retried. A database error other than "starting up", such
+    as a refused login, is raised at once.
+    """
+    deadline = monotonic() + timeout_seconds
+    while True:
+        try:
+            connect_db().close()
+            return
+        except (InterfaceError, DatabaseError) as error:
+            if (
+                isinstance(error, DatabaseError)
+                and sqlstate(error) != STARTING_UP_SQLSTATE
+            ):
+                raise
+            if monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Aurora didn't accept a login within {timeout_seconds} seconds"
+                ) from error
+            print(f"Waiting for Aurora to accept a login: {describe_error(error)}")
+            sleep(interval_seconds)
+
+
+def table_columns(db: Database, table: str) -> list[str]:
+    rows = db.execute(
         COLUMNS_SQL,
         {"schema_name": SCHEMA_NAME, "table_name": validate_identifier(table)},
     )
@@ -395,16 +486,13 @@ def parse_imported_rows(result: str) -> int:
     return int(match.group(1))
 
 
-def count_rows(api: DataApi, table: str, transaction_id: str | None = None) -> int:
-    rows = api.execute(
-        f"SELECT count(*) AS row_count FROM {qualified_name(table)}",
-        transaction_id=transaction_id,
-    )
+def count_rows(db: Database, table: str) -> int:
+    rows = db.execute(f"SELECT count(*) AS row_count FROM {qualified_name(table)}")
     return int(rows[0]["row_count"])
 
 
 def load_table(
-    api: DataApi,
+    db: Database,
     table: str,
     columns: list[str],
     parts: tuple[Part, ...],
@@ -415,35 +503,26 @@ def load_table(
 ) -> None:
     """Replace the table with the parts in one transaction, then analyze it."""
     name = qualified_name(table)
-    transaction_id = api.begin()
+    db.begin()
     try:
-        api.execute(
-            f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'", transaction_id=transaction_id
-        )
-        result.rows_before = count_rows(api, table, transaction_id)
-        api.execute(f"TRUNCATE TABLE {name}", transaction_id=transaction_id)
+        db.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
+        result.rows_before = count_rows(db, table)
+        db.execute(f"TRUNCATE TABLE {name}")
 
         imported = 0
         for part in parts:
             started = monotonic()
-            rows = api.execute(
-                IMPORT_SQL,
-                import_parameters(table, columns, part, null_marker),
-                transaction_id,
+            rows = db.execute(
+                IMPORT_SQL, import_parameters(table, columns, part, null_marker)
             )
             part_rows = parse_imported_rows(rows[0]["result"] if rows else "")
-            elapsed = monotonic() - started
             imported += part_rows
-            slow = (
-                " (slow, close to the 45 second Data API limit)"
-                if elapsed > SLOW_IMPORT_SECONDS
-                else ""
-            )
             print(
-                f"Imported {part_rows} rows from s3://{part.bucket}/{part.key} in {elapsed:.1f}s{slow}"
+                f"Imported {part_rows} rows from s3://{part.bucket}/{part.key} "
+                f"in {monotonic() - started:.1f}s"
             )
 
-        rows_after = count_rows(api, table, transaction_id)
+        rows_after = count_rows(db, table)
         if rows_after != imported:
             raise LoadError(f"{name} has {rows_after} rows after importing {imported}")
         if rows_after == 0 and result.rows_before and not allow_empty:
@@ -451,27 +530,29 @@ def load_table(
                 f"{name} would go from {result.rows_before} rows to 0. "
                 "Check the unload, or rerun with --allow_empty true."
             )
-        api.commit(transaction_id)
+        db.commit()
     except Exception:
         try:
-            api.rollback(transaction_id)
-        except (ClientError, BotoCoreError) as rollback_error:
-            # Keep the original error; the transaction times out on its own.
-            print(f"Rollback of {name} failed: {rollback_error}")
+            db.rollback()
+        except (DatabaseError, InterfaceError, OSError) as rollback_error:
+            # Keep the original error. The server rolls back when the session ends.
+            print(f"Rollback of {name} failed: {describe_error(rollback_error)}")
         raise
 
     result.rows_after = rows_after
     print(f"Loaded {name}: {result.rows_before} -> {rows_after} rows")
     try:
-        api.execute(f"ANALYZE {name}")
-    except (ClientError, BotoCoreError) as error:
+        db.execute(f"ANALYZE {name}")
+    except (DatabaseError, InterfaceError, OSError) as error:
         # The rows are committed. Stale statistics only slow queries until autovacuum runs.
-        print(f"WARNING: ANALYZE {name} failed; the load is kept: {error}")
+        print(
+            f"WARNING: ANALYZE {name} failed; the load is kept: {describe_error(error)}"
+        )
 
 
 def process_table(
     s3: Any,
-    api: DataApi | None,
+    connect_db: Callable[[], Database] | None,
     bucket: str,
     prefix: str,
     table: str,
@@ -492,19 +573,24 @@ def process_table(
             if ensure_gzip_encoding(s3, part):
                 result.encodings_fixed += 1
 
-        if dry_run or api is None:
+        if dry_run or connect_db is None:
             result.status = "dry_run"
             return result
 
-        columns = table_columns(api, table)
-        load_table(
-            api, table, columns, manifest.parts, result, null_marker, allow_empty
-        )
+        # A session per table, so a dropped connection fails only that table.
+        db = connect_db()
+        try:
+            columns = table_columns(db, table)
+            load_table(
+                db, table, columns, manifest.parts, result, null_marker, allow_empty
+            )
+        finally:
+            db.close()
         result.status = "loaded"
     except TABLE_ERRORS as error:
         # Every table is attempted; load_marts fails the job at the end.
         result.status = "failed"
-        result.error = f"{type(error).__name__}: {error}"
+        result.error = describe_error(error)
         print(f"Failed {qualified_name(table)}: {result.error}")
     return result
 
@@ -540,7 +626,7 @@ def upload_summary(
 
 def load_marts(
     s3: Any,
-    api: DataApi | None,
+    connect_db: Callable[[], Database] | None,
     source_bucket: str,
     source_prefix: str,
     tables: tuple[str, ...],
@@ -551,13 +637,13 @@ def load_marts(
     allow_empty: bool = False,
 ) -> list[TableResult]:
     """Load every table, upload the summary, and raise if any table failed."""
-    if api is not None and not dry_run:
-        api.wake()
+    if connect_db is not None and not dry_run:
+        wait_for_aurora(connect_db)
 
     results = [
         process_table(
             s3,
-            api,
+            connect_db,
             source_bucket,
             source_prefix,
             table,
@@ -607,15 +693,17 @@ class GlueSpreadsheetMartTables(GlueJobBase):
             "lz_bucket",
             "source_bucket",
             "source_prefix",
-            "aurora_cluster_arn",
-            "aurora_secret_arn",
         ]
 
         optional = [
             "JOB_NAME",
             "base_name",
             "s3_mid_path",
+            "aurora_host",
+            "aurora_port",
+            "aurora_user",
             "aurora_database",
+            "aurora_ca_bundle",
             "mart_tables",
             "null_marker",
             "allow_empty",
@@ -628,31 +716,42 @@ class GlueSpreadsheetMartTables(GlueJobBase):
         self.lz_bucket = args["lz_bucket"]
         self.source_bucket = args["source_bucket"]
         self.source_prefix = args["source_prefix"]
-        self.cluster_arn = args["aurora_cluster_arn"]
-        self.secret_arn = args["aurora_secret_arn"]
-        self.database = args.get("aurora_database", DB_NAME_DEFAULT)
         self.tables = parse_tables(args.get("mart_tables"))
         self.null_marker = args.get("null_marker", "")
         self.allow_empty = parse_bool(args.get("allow_empty"))
         self.dry_run = parse_bool(args.get("dry_run"))
         self.s3_mid_path = args.get("s3_mid_path", S3_MID_PATH_DEFAULT)
 
+        # A dry run doesn't touch Aurora, so it runs without the Aurora options.
+        self.login = None
+        self.ca_bundle = args.get("aurora_ca_bundle")
+        if not self.dry_run:
+            if "aurora_host" not in args or not self.ca_bundle:
+                raise ValueError(
+                    "--aurora_host and --aurora_ca_bundle are required unless --dry_run is true"
+                )
+            self.login = AuroraLogin(
+                host=args["aurora_host"],
+                port=int(args.get("aurora_port", DB_PORT_DEFAULT)),
+                user=args.get("aurora_user", DB_USER_DEFAULT),
+                database=args.get("aurora_database", DB_NAME_DEFAULT),
+            )
+
         job_name = args.get("JOB_NAME", "GlueSpreadsheetMartTables")
         self.init(job_name, args)
 
     def run(self) -> None:
         s3 = get_boto3_client("s3")
-        api = None
-        if not self.dry_run:
-            api = DataApi(
-                get_rds_data_client(), self.cluster_arn, self.secret_arn, self.database
-            )
-        else:
+        connect_db = None
+        if self.login is None:
             print("Dry run enabled: skipping the Aurora load")
+        else:
+            ssl_context = tls_context(read_s3_text(s3, self.ca_bundle))
+            connect_db = functools.partial(connect, self.login, ssl_context)
 
         load_marts(
             s3=s3,
-            api=api,
+            connect_db=connect_db,
             source_bucket=self.source_bucket,
             source_prefix=self.source_prefix,
             tables=self.tables,

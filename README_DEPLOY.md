@@ -90,10 +90,12 @@ no account boundary between them.
 
 > **`spreadsheet-mart-tables` is the exception.** It loads Aurora PostgreSQL `orcanexus-<stage>`
 > rather than Redshift, so it has no `rs-*` keys. Its own keys are in its
-> [README](spreadsheet-mart-tables/README.md#deployment). The module stack grants its own access,
-> as an extra inline policy on the shared Glue role, so `shared-infra` needs no change for it. Its
-> step 2 is the orcahouse DBA script `infra/aurora/dba/04_rw.sql`, then its `job/init.sql` run
-> against Aurora as `sadmin`, in place of the Redshift `init.sql` and grants.
+> [README](spreadsheet-mart-tables/README.md#deployment). It runs in the Aurora VPC through a
+> Glue network connection, and logs in with IAM database authentication. The module stack owns
+> its access and network, so `shared-infra` needs no change for it. Its step 2 is the orcahouse
+> DBA script `infra/aurora/dba/04_rw.sql`, then its `job/init.sql` run against Aurora as
+> `sadmin`, in place of the Redshift `init.sql` and grants. Before its step 4, run `make wheels`
+> in the module directory.
 
 ## Deploy Process
 

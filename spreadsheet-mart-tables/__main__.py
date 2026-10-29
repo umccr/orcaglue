@@ -1,6 +1,8 @@
+import glob
 import hashlib
 import json
 import os
+import re
 
 import pulumi
 import pulumi_aws as aws
@@ -15,17 +17,22 @@ config = pulumi.Config()
 
 requirements = config.require("requirements")
 job_script = config.require("job-script")
+rds_ca_bundle = config.require("rds-ca-bundle")
 lz_bucket = config.require("lz-bucket")
 source_bucket = config.require("source-bucket")
 source_prefix = config.require("source-prefix")
 aurora_cluster_id = config.require("aurora-cluster")
 aurora_database = config.get("aurora-database") or "orcanexus"
-aurora_secret_name = config.require("aurora-secret")
+aurora_user = config.get("aurora-user") or "dbuser_rw"
+glue_subnet_name = config.require("glue-subnet")
 mart_tables = config.require("mart-tables")
 shared_infra_path = config.require("shared-infra")
 # Default is 18:00 UTC = 04:00 AEST / 05:00 AEDT. Set it after the Redshift UNLOAD.
 schedule = config.get("schedule") or "cron(0 18 * * ? *)"
 trigger_enabled = config.get_bool("trigger-enabled")
+
+# `make wheels` downloads the wheels pinned in the requirements into this directory.
+wheel_dir = "build/wheels"
 
 shared_infra_ref = pulumi.StackReference(shared_infra_path)
 shared_glue_role_arn = shared_infra_ref.get_output("shared_glue_role_arn")
@@ -42,9 +49,13 @@ source_bucket_info = aws.s3.get_bucket(bucket=source_bucket)
 
 # Created and managed by orcahouse infra/aurora.
 aurora_cluster = aws.rds.get_cluster(cluster_identifier=aurora_cluster_id)
+if not aurora_cluster.iam_database_authentication_enabled:
+    raise ValueError(
+        f"Aurora {aurora_cluster_id} has IAM database authentication off; the job logs in with it"
+    )
 
-# Created by orcahouse infra/aurora/dba/04_rw.sql. The Data API calls run as this login.
-aurora_secret = aws.secretsmanager.get_secret(name=aurora_secret_name)
+# Managed by the university: a private subnet of UomPrimaryVpc, the Aurora cluster's VPC.
+glue_subnet = aws.ec2.get_subnet(tags={"Name": glue_subnet_name})
 
 job_name = "spreadsheet-mart-tables"
 
@@ -54,6 +65,14 @@ job_name = "spreadsheet-mart-tables"
 # is an extra inline policy on that role, owned by this stack, so it is deployed and destroyed
 # with the job. The role name is the last part of the shared role ARN.
 shared_glue_role_name = shared_glue_role_arn.apply(lambda arn: arn.split("/")[-1])
+
+# The login of the database user, which orcahouse infra/aurora/dba/04_rw.sql creates with
+# rds_iam. The ARN names the cluster by its resource ID, which outlives a rename.
+_, partition, _, region, account = aurora_cluster.arn.split(":")[:5]
+aurora_dbuser_arn = (
+    f"arn:{partition}:rds-db:{region}:{account}:dbuser:"
+    f"{aurora_cluster.cluster_resource_id}/{aurora_user}"
+)
 
 mart_import_policy = aws.iam.RolePolicy(
     "mart-import-policy",
@@ -84,26 +103,12 @@ mart_import_policy = aws.iam.RolePolicy(
                     ),
                     "Resource": [f"{source_bucket_info.arn}/{source_prefix}*"],
                 },
-                # RDS Data API — scoped to the Aurora cluster
+                # IAM database authentication: an auth token for this database user only
                 {
-                    "Sid": "AuroraDataAPI",
+                    "Sid": "AuroraIamAuth",
                     "Effect": "Allow",
-                    "Action": sorted(
-                        [
-                            "rds-data:BeginTransaction",
-                            "rds-data:CommitTransaction",
-                            "rds-data:ExecuteStatement",
-                            "rds-data:RollbackTransaction",
-                        ]
-                    ),
-                    "Resource": [aurora_cluster.arn],
-                },
-                # The database login secret the Data API calls run as
-                {
-                    "Sid": "AuroraSecretAccess",
-                    "Effect": "Allow",
-                    "Action": ["secretsmanager:GetSecretValue"],
-                    "Resource": [aurora_secret.arn],
+                    "Action": ["rds-db:connect"],
+                    "Resource": [aurora_dbuser_arn],
                 },
             ],
         }
@@ -111,6 +116,78 @@ mart_import_policy = aws.iam.RolePolicy(
 )
 
 pulumi.export("mart_import_policy_name", mart_import_policy.name)
+
+# --- Network: the job runs in the Aurora cluster's VPC ---
+
+# Glue attaches the job's network interfaces to the subnet with this security group. The
+# Aurora security group already allows the whole VPC, so it needs no change.
+glue_security_group = aws.ec2.SecurityGroup(
+    "glue-security-group",
+    name=f"{stack_prefix}-{stack_stage}-{job_name}-sg",
+    description=f"Glue job {job_name}: its workers, AWS APIs and Aurora",
+    vpc_id=glue_subnet.vpc_id,
+)
+
+# Glue requires a self-referencing rule for all TCP ports, between the job's workers.
+glue_self_ingress = aws.vpc.SecurityGroupIngressRule(
+    "glue-self-ingress",
+    security_group_id=glue_security_group.id,
+    referenced_security_group_id=glue_security_group.id,
+    ip_protocol="tcp",
+    from_port=0,
+    to_port=65535,
+    description="Glue workers",
+)
+
+glue_self_egress = aws.vpc.SecurityGroupEgressRule(
+    "glue-self-egress",
+    security_group_id=glue_security_group.id,
+    referenced_security_group_id=glue_security_group.id,
+    ip_protocol="tcp",
+    from_port=0,
+    to_port=65535,
+    description="Glue workers",
+)
+
+# HTTPS to AWS: S3 through its gateway endpoint, Glue through its interface endpoint, and the
+# other APIs (CloudWatch Logs) through the university transit gateway.
+glue_https_egress = aws.vpc.SecurityGroupEgressRule(
+    "glue-https-egress",
+    security_group_id=glue_security_group.id,
+    cidr_ipv4="0.0.0.0/0",
+    ip_protocol="tcp",
+    from_port=443,
+    to_port=443,
+    description="AWS APIs",
+)
+
+glue_aurora_egress = [
+    aws.vpc.SecurityGroupEgressRule(
+        f"glue-aurora-egress-{aurora_security_group_id}",
+        security_group_id=glue_security_group.id,
+        referenced_security_group_id=aurora_security_group_id,
+        ip_protocol="tcp",
+        from_port=aurora_cluster.port,
+        to_port=aurora_cluster.port,
+        description=f"Aurora {aurora_cluster_id}",
+    )
+    for aurora_security_group_id in aurora_cluster.vpc_security_group_ids
+]
+
+glue_connection = aws.glue.Connection(
+    "glue-connection",
+    name=f"{stack_prefix}-{stack_stage}-{job_name}-vpc",
+    connection_type="NETWORK",
+    description=f"Runs the {job_name} job in the VPC of Aurora {aurora_cluster_id}",
+    physical_connection_requirements=aws.glue.ConnectionPhysicalConnectionRequirementsArgs(
+        availability_zone=glue_subnet.availability_zone,
+        subnet_id=glue_subnet.id,
+        security_group_id_lists=[glue_security_group.id],
+    ),
+)
+
+pulumi.export("glue_connection_name", glue_connection.name)
+pulumi.export("glue_security_group_id", glue_security_group.id)
 
 # --- S3 Uploads ---
 
@@ -125,16 +202,47 @@ def file_md5(path: str) -> str:
         return hashlib.md5(handle.read()).hexdigest()
 
 
-# Upload requirements.txt
-requirements_s3 = aws.s3.BucketObject(
-    "requirements-txt",
+def pinned_wheels(requirements_path: str) -> list[str]:
+    """The downloaded wheel of each pin in the requirements, in the same order."""
+    with open(requirements_path) as handle:
+        pins = re.findall(r"^([\w.-]+)==(\S+)", handle.read(), flags=re.MULTILINE)
+
+    wheels = []
+    for name, version in pins:
+        pattern = os.path.join(wheel_dir, f"{name.replace('-', '_')}-{version}-*.whl")
+        matches = glob.glob(pattern)
+        if len(matches) != 1:
+            raise FileNotFoundError(
+                f"No wheel {pattern}. Run `make wheels` in the module directory first."
+            )
+        wheels.extend(matches)
+    return wheels
+
+
+# Upload the job's Python wheels. Glue installs them from S3 only, so a run never needs PyPI.
+wheels_s3 = [
+    aws.s3.BucketObject(
+        f"wheel-{os.path.basename(path)}",
+        bucket=landing_zone_bucket.bucket,
+        key=f"{s3_mid_path}/wheels/{os.path.basename(path)}",
+        source=pulumi.FileAsset(path),
+        etag=file_md5(path),
+    )
+    for path in pinned_wheels(requirements)
+]
+
+pulumi.export("wheel_s3_keys", [wheel.key for wheel in wheels_s3])
+
+# Upload the RDS regional CA bundle, which the job verifies Aurora's certificate with
+rds_ca_bundle_s3 = aws.s3.BucketObject(
+    "rds-ca-bundle",
     bucket=landing_zone_bucket.bucket,
-    key=f"{s3_mid_path}/requirements.txt",
-    source=pulumi.FileAsset(requirements),
-    etag=file_md5(requirements),
+    key=f"{s3_mid_path}/{os.path.basename(rds_ca_bundle)}",
+    source=pulumi.FileAsset(rds_ca_bundle),
+    etag=file_md5(rds_ca_bundle),
 )
 
-pulumi.export("requirements_s3_key", requirements_s3.key)
+pulumi.export("rds_ca_bundle_s3_key", rds_ca_bundle_s3.key)
 
 # Upload job script
 job_script_s3 = aws.s3.BucketObject(
@@ -157,6 +265,7 @@ glue_job = aws.glue.Job(
     worker_type="G.1X",
     number_of_workers=2,
     timeout=30,
+    connections=[glue_connection.name],
     command=aws.glue.JobCommandArgs(
         name="glueetl",
         script_location=pulumi.Output.all(
@@ -167,27 +276,40 @@ glue_job = aws.glue.Job(
     ),
     default_arguments=pulumi.Output.all(
         landing_zone_bucket.bucket,
-        requirements_s3.key,
+        rds_ca_bundle_s3.key,
+        *[wheel.key for wheel in wheels_s3],
     ).apply(
         lambda args: {
             "--job-language": "python",
-            "--python-modules-installer-option": "-r",
-            "--additional-python-modules": f"s3://{args[0]}/{args[1]}",
+            "--python-modules-installer-option": "--no-index",
+            "--additional-python-modules": ",".join(
+                f"s3://{args[0]}/{key}" for key in args[2:]
+            ),
             "--lz_bucket": args[0],
             "--base_name": base_name,
             "--s3_mid_path": s3_mid_path,
             "--source_bucket": source_bucket,
             "--source_prefix": source_prefix,
-            "--aurora_cluster_arn": aurora_cluster.arn,
-            "--aurora_secret_arn": aurora_secret.arn,
+            "--aurora_host": aurora_cluster.endpoint,
+            "--aurora_port": str(aurora_cluster.port),
+            "--aurora_user": aurora_user,
             "--aurora_database": aurora_database,
+            "--aurora_ca_bundle": f"s3://{args[0]}/{args[1]}",
             "--mart_tables": mart_tables,
             "--allow_empty": "false",
             "--dry_run": "false",
         }
     ),
-    # A run must not start before the job's access exists.
-    opts=pulumi.ResourceOptions(depends_on=[mart_import_policy]),
+    # A run must not start before the job's access and network rules exist.
+    opts=pulumi.ResourceOptions(
+        depends_on=[
+            mart_import_policy,
+            glue_self_ingress,
+            glue_self_egress,
+            glue_https_egress,
+            *glue_aurora_egress,
+        ]
+    ),
 )
 
 pulumi.export("glue_job_name", glue_job.name)
