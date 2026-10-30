@@ -1,0 +1,165 @@
+{
+  "about": "The Aurora mart tables, which the spreadsheet-mart-tables job creates at every run. The columns are generated from the Redshift mart by `make ddl`; don't edit them. The indexes are edited by hand, as lists of column names, and `make ddl` keeps them.",
+  "source": "Redshift workgroup orcahouse-dev, database orcavault, region ap-southeast-2",
+  "tables": {
+    "bam": {
+      "columns": [
+        ["portal_run_id", "char(16)"],
+        ["cohort_id", "varchar(255)"],
+        ["bucket", "varchar(63)"],
+        ["key", "varchar(1024)"],
+        ["library_id", "varchar(255)"],
+        ["filename", "varchar(1024)"],
+        ["format", "varchar(255)"],
+        ["size", "bigint"],
+        ["storage_class", "varchar(255)"],
+        ["e_tag", "varchar(255)"],
+        ["last_modified_date", "timestamptz"]
+      ],
+      "indexes": []
+    },
+    "em_library_aliases": {
+      "columns": [
+        ["library_id", "varchar(255)"],
+        ["alias_library_id", "varchar(255)"],
+        ["run", "varchar(257)"],
+        ["sheet_name", "varchar(257)"],
+        ["comments", "varchar(257)"],
+        ["record_source", "varchar(255)"],
+        ["load_datetime", "timestamptz"]
+      ],
+      "indexes": []
+    },
+    "em_library_dns": {
+      "columns": [
+        ["sheet_name", "varchar(257)"],
+        ["run", "varchar(257)"],
+        ["comments", "varchar(257)"],
+        ["library_id", "varchar(255)"],
+        ["alias_library_id", "varchar(255)"],
+        ["internal_subject_id", "varchar(255)"],
+        ["external_subject_id", "varchar(255)"],
+        ["sample_id", "varchar(255)"],
+        ["external_sample_id", "varchar(255)"],
+        ["experiment_id", "varchar(255)"],
+        ["project_id", "varchar(255)"],
+        ["owner_id", "varchar(255)"],
+        ["workflow", "varchar(255)"],
+        ["phenotype", "varchar(255)"],
+        ["type", "varchar(255)"],
+        ["assay", "varchar(255)"],
+        ["quality", "varchar(255)"],
+        ["source", "varchar(255)"],
+        ["truseq_index", "varchar(255)"],
+        ["record_source", "varchar(255)"],
+        ["load_datetime", "timestamptz"]
+      ],
+      "indexes": []
+    },
+    "em_library_services": {
+      "columns": [
+        ["library_id", "varchar(255)"],
+        ["metadata_manager", "smallint"],
+        ["workflow_manager", "smallint"],
+        ["sequence_run_manager", "smallint"]
+      ],
+      "indexes": []
+    },
+    "fastq": {
+      "columns": [
+        ["sequencing_run_id", "varchar(255)"],
+        ["sequencing_run_date", "date"],
+        ["portal_run_id", "char(16)"],
+        ["cohort_id", "varchar(255)"],
+        ["bucket", "varchar(63)"],
+        ["key", "varchar(1024)"],
+        ["library_id", "varchar(255)"],
+        ["filename", "varchar(1024)"],
+        ["format", "varchar(255)"],
+        ["size", "bigint"],
+        ["storage_class", "varchar(255)"],
+        ["e_tag", "varchar(255)"],
+        ["last_modified_date", "timestamptz"]
+      ],
+      "indexes": []
+    },
+    "lims": {
+      "columns": [
+        ["sequencing_run_id", "varchar(255)"],
+        ["sequencing_run_date", "date"],
+        ["library_id", "varchar(255)"],
+        ["alias_library_id", "varchar(255)"],
+        ["internal_subject_id", "varchar(255)"],
+        ["external_subject_id", "varchar(255)"],
+        ["sample_id", "varchar(255)"],
+        ["external_sample_id", "varchar(255)"],
+        ["experiment_id", "varchar(255)"],
+        ["project_id", "varchar(255)"],
+        ["owner_id", "varchar(255)"],
+        ["workflow", "varchar(255)"],
+        ["phenotype", "varchar(255)"],
+        ["type", "varchar(255)"],
+        ["assay", "varchar(255)"],
+        ["quality", "varchar(255)"],
+        ["source", "varchar(255)"],
+        ["truseq_index", "varchar(255)"],
+        ["load_datetime", "timestamptz"]
+      ],
+      "indexes": [["sequencing_run_id"]]
+    },
+    "vcf": {
+      "columns": [
+        ["portal_run_id", "char(16)"],
+        ["cohort_id", "varchar(255)"],
+        ["bucket", "varchar(63)"],
+        ["key", "varchar(1024)"],
+        ["library_id", "varchar(255)"],
+        ["filename", "varchar(1024)"],
+        ["format", "varchar(255)"],
+        ["size", "bigint"],
+        ["storage_class", "varchar(255)"],
+        ["e_tag", "varchar(255)"],
+        ["last_modified_date", "timestamptz"]
+      ],
+      "indexes": []
+    },
+    "workflow": {
+      "columns": [
+        ["portal_run_id", "char(16)"],
+        ["library_id", "varchar(255)"],
+        ["workflow_name", "varchar(255)"],
+        ["workflow_version", "varchar(255)"],
+        ["workflow_status", "varchar(255)"],
+        ["workflow_start", "timestamptz"],
+        ["workflow_end", "timestamptz"],
+        ["workflow_duration", "numeric(12,4)"],
+        ["workflow_comment", "varchar(65535)"]
+      ],
+      "indexes": []
+    },
+    "workflow_cost_report": {
+      "columns": [
+        ["portal_run_id", "char(16)"],
+        ["workflow_name", "varchar(255)"],
+        ["workflow_version", "varchar(255)"],
+        ["workflow_status", "varchar(255)"],
+        ["total_cost", "numeric(18,2)"],
+        ["compute_cost", "numeric(18,2)"],
+        ["license_cost", "numeric(18,2)"],
+        ["ica_project", "varchar(255)"],
+        ["cost_unit", "varchar(255)"]
+      ],
+      "indexes": []
+    },
+    "workflow_output": {
+      "columns": [
+        ["portal_run_id", "char(16)"],
+        ["cohort_id", "varchar(255)"],
+        ["bucket", "varchar(63)"],
+        ["prefix", "varchar(1024)"],
+        ["key_count", "bigint"]
+      ],
+      "indexes": []
+    }
+  }
+}

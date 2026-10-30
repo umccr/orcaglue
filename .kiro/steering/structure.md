@@ -10,6 +10,7 @@ orcaglue/
 ├── shared-infra/             # Pulumi stack: shared IAM Glue role + Redshift grants
 ├── shared-lib/               # Installable Python package: orcaglue_shared_lib
 ├── spreadsheet-google-lims/  # Example real ETL module
+├── spreadsheet-mart-tables/  # Reverse ETL: mart CSV unload → Aurora orcanexus (VPC connection + IAM DB auth, blue-green table swap, not Redshift)
 ├── requirements.txt          # Runtime deps shared across all Glue jobs
 ├── requirements-dev.txt      # Dev/CI toolchain (installs requirements.txt + shared-lib)
 ├── Makefile                  # install / check / scan / baseline targets
