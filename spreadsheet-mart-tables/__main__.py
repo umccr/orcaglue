@@ -18,6 +18,7 @@ config = pulumi.Config()
 requirements = config.require("requirements")
 job_script = config.require("job-script")
 rds_ca_bundle = config.require("rds-ca-bundle")
+mart_ddl = config.require("mart-ddl")
 lz_bucket = config.require("lz-bucket")
 source_bucket = config.require("source-bucket")
 source_prefix = config.require("source-prefix")
@@ -26,6 +27,8 @@ aurora_database = config.get("aurora-database") or "orcanexus"
 aurora_user = config.get("aurora-user") or "dbuser_rw"
 glue_subnet_name = config.require("glue-subnet")
 mart_tables = config.require("mart-tables")
+# Granted SELECT on each new mart table. The swap drops the old table with its grants.
+mart_readers = config.get("mart-readers") or "dbuser_ro"
 shared_infra_path = config.require("shared-infra")
 # Default is 18:00 UTC = 04:00 AEST / 05:00 AEDT. Set it after the Redshift UNLOAD.
 schedule = config.get("schedule") or "cron(0 18 * * ? *)"
@@ -244,6 +247,17 @@ rds_ca_bundle_s3 = aws.s3.BucketObject(
 
 pulumi.export("rds_ca_bundle_s3_key", rds_ca_bundle_s3.key)
 
+# Upload the mart table DDL, which the job creates each shadow table from
+mart_ddl_s3 = aws.s3.BucketObject(
+    "mart-ddl",
+    bucket=landing_zone_bucket.bucket,
+    key=f"{s3_mid_path}/{os.path.basename(mart_ddl)}",
+    source=pulumi.FileAsset(mart_ddl),
+    etag=file_md5(mart_ddl),
+)
+
+pulumi.export("mart_ddl_s3_key", mart_ddl_s3.key)
+
 # Upload job script
 job_script_s3 = aws.s3.BucketObject(
     "job-script",
@@ -277,13 +291,14 @@ glue_job = aws.glue.Job(
     default_arguments=pulumi.Output.all(
         landing_zone_bucket.bucket,
         rds_ca_bundle_s3.key,
+        mart_ddl_s3.key,
         *[wheel.key for wheel in wheels_s3],
     ).apply(
         lambda args: {
             "--job-language": "python",
             "--python-modules-installer-option": "--no-index",
             "--additional-python-modules": ",".join(
-                f"s3://{args[0]}/{key}" for key in args[2:]
+                f"s3://{args[0]}/{key}" for key in args[3:]
             ),
             "--lz_bucket": args[0],
             "--base_name": base_name,
@@ -295,7 +310,9 @@ glue_job = aws.glue.Job(
             "--aurora_user": aurora_user,
             "--aurora_database": aurora_database,
             "--aurora_ca_bundle": f"s3://{args[0]}/{args[1]}",
+            "--mart_ddl": f"s3://{args[0]}/{args[2]}",
             "--mart_tables": mart_tables,
+            "--mart_readers": mart_readers,
             "--allow_empty": "false",
             "--dry_run": "false",
         }

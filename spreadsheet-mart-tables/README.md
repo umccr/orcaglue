@@ -6,10 +6,13 @@
   - [What This Job Does](#what-this-job-does)
     - [Input Contract](#input-contract)
     - [Load and Validation Flow](#load-and-validation-flow)
+    - [Blue-Green Swap](#blue-green-swap)
     - [Known Limitations](#known-limitations)
   - [Deployment](#deployment)
     - [Network and Login](#network-and-login)
   - [Aurora Setup](#aurora-setup)
+    - [Ownership](#ownership)
+    - [Mart DDL](#mart-ddl)
   - [Glue Job Run](#glue-job-run)
   - [Local Development](#local-development)
   - [Destroy](#destroy)
@@ -29,8 +32,11 @@ The job:
 - Sets `Content-Encoding: gzip` on each CSV part, by copying it onto itself. The Aurora
   `aws_s3` import only decompresses objects that carry that metadata, and Redshift UNLOAD
   doesn't set it.
-- Replaces each Aurora `mart` table in one transaction: `TRUNCATE`, then one
-  `aws_s3.table_import_from_s3` call per part, which runs a PostgreSQL `COPY` from S3.
+- Refreshes each Aurora `mart` table with a [blue-green swap](#blue-green-swap). It loads a
+  shadow copy of the table in the `mart_stg` schema, with one `aws_s3.table_import_from_s3`
+  call per part, each a PostgreSQL `COPY` from S3. Then it swaps the copy in for the `mart`
+  table in one transaction. The OrcaNexus API reads the old table until the swap, and the new
+  one after it.
 - Writes a JSON run summary to the landing zone.
 
 It runs in the Aurora cluster's VPC through a Glue network connection, and logs in to Aurora
@@ -84,19 +90,22 @@ refused login fails the job at once.
 
 Then, for each table, in its own session and one transaction:
 
-1. `SET LOCAL lock_timeout = '30s'`, so a long-running reader can't hold the load forever.
-2. Count the current rows, then `TRUNCATE` the table.
-3. Import each part with `(format csv, header match)`. `HEADER MATCH` fails the import if the
-   CSV header doesn't match the table's columns by name and order, which catches a mart that
-   changed without `job/init.sql` being regenerated.
-4. Check that the table's row count equals the sum of the rows reported by the imports.
-5. Refuse to replace a non-empty table with 0 rows, unless the job runs with
+1. `SET LOCAL lock_timeout = '5s'`, which limits how long the swap waits for readers.
+2. Create the shadow table `mart_stg.<table>` from the table's columns in
+   [job/mart_tables.json](job/mart_tables.json). See [Mart DDL](#mart-ddl).
+3. Import each part into it with `(format csv, header match)`. `HEADER MATCH` fails the import
+   if the CSV header doesn't match the table's columns by name and order, which catches a mart
+   that changed without `job/mart_tables.json` being regenerated.
+4. Check that the shadow table's row count equals the sum of the rows reported by the imports.
+5. Refuse to replace a non-empty `mart` table with 0 rows, unless the job runs with
    `--allow_empty true`.
-6. `COMMIT`, then `ANALYZE` the table.
+6. Build the table's indexes, `ANALYZE` it, and grant `SELECT` on it to the `mart-readers`.
+7. Swap: `DROP TABLE mart.<table>`, then `ALTER TABLE mart_stg.<table> SET SCHEMA mart`, then
+   `COMMIT`.
 
-Any error rolls the table back, so it keeps its previous rows. Every table is attempted. The
-job fails at the end if any table failed, which raises the Glue job failure alert in Slack
-through the
+Any error rolls the table back, so it keeps its previous rows, and no shadow table is left.
+Every table is attempted. The job fails at the end if any table failed, which raises the Glue
+job failure alert in Slack through the
 [orcahouse notification stack](https://github.com/umccr/orcahouse/tree/main/infra/notification).
 
 The summary at `s3://<lz-bucket>/orcaglue/spreadsheet__mart_tables/<stage>/orcanexus_mart_tables.manifest.json`
@@ -105,10 +114,38 @@ records each table's status, parts, bytes, rows before and after, and the manife
 PostgreSQL SQLSTATE and message. The summary also lists the manifests under the prefix that
 aren't in `--mart_tables` (`unlisted_tables`): a new mart that needs adding.
 
+### Blue-Green Swap
+
+Each table is refreshed without downtime for the OrcaNexus API:
+
+- **Nobody else sees the shadow table.** It is in the `mart_stg` schema, which `dbuser_ro`
+  can't use, and in a transaction that hasn't committed. A failed load rolls back and leaves
+  nothing behind.
+- **Readers use the old table during the load.** Until the swap, the job only reads the `mart`
+  table, so the API's queries don't wait for the load.
+- **The swap is two catalog changes and a commit.** It drops the `mart` table, then moves the
+  shadow table into `mart` with its indexes, statistics and grants. Each query sees the old
+  table or the new one, never a partly loaded or an empty table. The drop comes first, so the
+  shadow table's indexes can keep their names in `mart`.
+- **The swap waits briefly, then retries.** The drop needs the table's exclusive lock, so it
+  waits for the queries running on the table, and queries that arrive meanwhile queue behind
+  it. After 5 seconds, `lock_timeout` ends the wait. The job rolls back to a savepoint taken
+  before the swap, waits 10 seconds, and tries again, up to 6 times, without redoing the load.
+  If a reader still holds the table, the table fails and keeps its rows.
+
 ### Known Limitations
 
-- **Readers wait during a load.** `TRUNCATE` takes an exclusive lock until the commit, so
-  OrcaNexus API reads of a table wait while that table loads (seconds per table).
+- **A swap can make queries wait for up to 5 seconds**, while it waits for a long-running query
+  on the table. A query or transaction held open past the retries, such as an idle transaction
+  in `psql`, fails that table's refresh with `55P03`.
+- **No views or foreign keys on the mart tables.** The swap won't drop a table that other
+  objects depend on, so that table fails with `2BP01`, and keeps its rows.
+- **The job sets the grants.** Each swap replaces the table, and the old table's grants go with
+  it. The job grants `SELECT` to the roles in `mart-readers`, so don't grant on the tables by
+  hand.
+- **Each table swaps on its own.** During a run, some tables can be a refresh ahead of others.
+- **A column change reaches the API at the swap**, so change the OrcaNexus jOOQ model with it. A
+  query prepared before the swap can fail once with `cached plan must not change result type`.
 - **A statement has 10 minutes.** The session's `statement_timeout` ends a longer import. The
   job logs the time of each import. If a part gets close, unload with `MAXFILESIZE` to make the
   parts smaller.
@@ -123,11 +160,11 @@ Follow **[README_DEPLOY.md](../README_DEPLOY.md)** for prerequisites and the Pul
 This module differs from the TSA modules: its target is Aurora, not Redshift, and it runs in
 the Aurora cluster's VPC.
 
-Prerequisites, once per stage, in order:
-
-1. **The `dbuser_rw` login**, from the orcahouse DBA script `infra/aurora/dba/04_rw.sql`. It
-   logs in with IAM database authentication (`rds_iam`), so it has no password or secret.
-2. **The target tables**, from [job/init.sql](job/init.sql). See [Aurora Setup](#aurora-setup).
+The prerequisite, once per stage, is **the `dbuser_rw` login**, from the orcahouse DBA script
+`infra/aurora/dba/04_rw.sql`. It logs in with IAM database authentication (`rds_iam`), so it
+has no password or secret. The script also creates the `mart_stg` schema, and lets `dbuser_rw`
+create tables there and in `mart`. The job creates the `mart` tables at its first run. See
+[Aurora Setup](#aurora-setup).
 
 Before each `pulumi preview` or `pulumi up`, download the job's wheels from the module root
 on the host. The stack uploads them, and fails if they are missing:
@@ -144,7 +181,7 @@ are deployed and destroyed with the job:
 | Inline policy `orcaglue-<stage>-spreadsheet-mart-tables-policy` on the shared Glue role | The job's S3 and Aurora access, below |
 | Security group `orcaglue-<stage>-spreadsheet-mart-tables-sg` | The job's network rules. See [Network and Login](#network-and-login) |
 | Glue connection `orcaglue-<stage>-spreadsheet-mart-tables-vpc` | A `NETWORK` connection in `glue-subnet`, which runs the job in the Aurora VPC |
-| The wheels and the RDS CA bundle | Uploaded next to the job script in the landing zone |
+| The wheels, the RDS CA bundle and the DDL file | Uploaded next to the job script in the landing zone |
 
 | Statement | Grants |
 |---|---|
@@ -164,13 +201,15 @@ Module-specific config, in [Pulumi.dev.yaml](Pulumi.dev.yaml):
 |---|---|---|
 | `requirements` | `job/requirements.txt` | The job's own pinned wheels, not the shared `requirements.txt`. `make wheels` downloads them |
 | `rds-ca-bundle` | `job/rds-ca-ap-southeast-2-bundle.pem` | The CA bundle the job verifies Aurora's certificate with |
+| `mart-ddl` | `job/mart_tables.json` | The table DDL, which the job creates each shadow table from. See [Mart DDL](#mart-ddl) |
 | `source-bucket` | `orcavault-dev-warehouse-115253169271-ap-southeast-2-an` | The UNLOAD target bucket |
 | `source-prefix` | `v1/csv/mart/` | The prefix holding one folder per mart table |
 | `aurora-cluster` | `orcanexus-dev` | The Aurora cluster; the stack looks up its endpoint, port, resource ID and security group |
 | `aurora-database` | `orcanexus` | The Aurora database |
 | `aurora-user` | `dbuser_rw` | The database user, created with `rds_iam` by `04_rw.sql` |
 | `glue-subnet` | `UomPrimaryPrivateSubnetA` | The `Name` tag of the private subnet for the Glue connection, in the Aurora writer's AZ |
-| `mart-tables` | `bam,em_library_aliases,…,workflow_output` | The tables to load. Keep in sync with `job/init.sql`. Prod lists only the 7 Centre marts |
+| `mart-tables` | `bam,em_library_aliases,…,workflow_output` | The tables to load. Each must be in `job/mart_tables.json`. Prod lists only the 7 Centre marts |
+| `mart-readers` | `dbuser_ro` | The roles granted `SELECT` on each new table |
 | `trigger-enabled` | `"false"` | The schedule stays off until the UNLOAD is scheduled and a manual run is validated |
 | `schedule` | `cron(0 18 * * ? *)` | 04:00 AEST / 05:00 AEDT. Set it to run after the UNLOAD |
 
@@ -204,34 +243,46 @@ Aurora directly:
 
 ## Aurora Setup
 
-[job/init.sql](job/init.sql) creates the 10 target tables in `mart`, with the exact Redshift
-column types and order. It is generated from the Redshift mart columns, so don't edit it by
-hand. Regenerate it after a mart changes, from the module root on the host:
+The job creates and replaces the `mart` tables itself, so the only DBA step is
+`04_rw.sql`. See [Deployment](#deployment).
 
-```bash
-export AWS_PROFILE=unimelb-warehouse-prod-admin
-make init-sql
-git diff job/init.sql
-```
+### Ownership
 
-Run it as the Aurora master user `sadmin` in the `orcanexus` database. Use the RDS Query
-Editor with the cluster's master secret, or `psql` through the OrcaNexus bastion tunnel. Run it
-after `04_rw.sql`, because its grants name `dbuser_rw`.
+`dbuser_rw` creates the `mart` tables, so it owns them, which lets it drop and replace them.
+`04_rw.sql` gives it `USAGE` and `CREATE` on `mart` and `mart_stg`, and nothing more in the
+database. The master user `sadmin` can read the tables, because `rds_superuser` has
+`pg_read_all_data`, but it can't drop or alter them: it isn't a member of `dbuser_rw`. To
+change a table by hand, log in as `dbuser_rw` with an IAM auth token.
 
-> **It drops and recreates every table**, which deletes the loaded rows until the next job
-> run reloads them. Don't run it while the job or the OrcaNexus API is using the tables. After
-> a column change, regenerate the OrcaNexus jOOQ model as well.
+A `mart` table that the job didn't create, such as one from the earlier `job/init.sql`, fails
+its refresh with `42501 must be owner of table`. Drop it as `sadmin`, and the next run creates
+it.
 
-`job/init.sql` is generated from Redshift dev, whose `mart` has 10 tables. The prod Redshift
-`mart` has only the 7 Centre marts; their columns are identical to dev's (checked 2026-10-27).
-For prod, generate and run the DDL for those 7 tables instead:
+### Mart DDL
 
-```bash
-python job/generate_init_sql.py --workgroup orcahouse-prod \
-  --secret-arn 'redshift!orcahouse-prod-admin' \
-  --tables bam,fastq,lims,vcf,workflow,workflow_cost_report,workflow_output \
-  --output /tmp/init-prod.sql
-```
+[job/mart_tables.json](job/mart_tables.json) holds each table's columns, with the exact
+Redshift column types and order, and its indexes. The job creates every shadow table from it,
+so a change reaches Aurora at the first run after `pulumi up`, with no DBA step.
+
+- **Columns** are generated from the Redshift mart columns, so don't edit them by hand.
+  Regenerate them after a mart changes, from the module root on the host, then change the
+  OrcaNexus jOOQ model to match:
+
+  ```bash
+  export AWS_PROFILE=unimelb-warehouse-prod-admin
+  make ddl
+  git diff job/mart_tables.json
+  ```
+
+- **Indexes** are edited by hand, as lists of column names, and `make ddl` keeps them. The job
+  names each `<table>_<columns>_idx`, and builds it after the load. Add indexes for the
+  OrcaNexus API's filters and sort orders. `lims` has one on `sequencing_run_id`, the column
+  the API pages it by.
+
+The file is generated from Redshift dev, whose `mart` has 10 tables. The prod Redshift `mart`
+has only the 7 Centre marts, with the same columns as dev's (checked 2026-10-27). The prod job
+creates only the tables in its `mart-tables`. If prod's columns ever differ from dev's,
+`HEADER MATCH` fails that table, and it keeps its rows.
 
 ## Glue Job Run
 
@@ -287,5 +338,6 @@ make test
 ## Destroy
 
 See [Teardown](../README_DEPLOY.md#teardown). The security group and the Glue connection are
-part of the stack. The Aurora tables and the `dbuser_rw` login are not; drop them with a DBA
-script if the module is retired.
+part of the stack. The Aurora tables, the `mart_stg` schema and the `dbuser_rw` login are not.
+To retire the module, drop the tables as `dbuser_rw`, their owner, then the login and the schema
+as `sadmin`.

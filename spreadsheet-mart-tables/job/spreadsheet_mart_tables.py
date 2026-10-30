@@ -6,11 +6,14 @@ A Redshift UNLOAD writes each mart table as gzip CSV parts with a manifest:
     <source_prefix><table>/<table>_manifest
 
 For every table, this job sets Content-Encoding: gzip on the parts, which the
-Aurora aws_s3 import requires and UNLOAD doesn't set, then replaces the Aurora
-table. The job reaches the private cluster through a Glue network connection in
-its VPC, and logs in over TLS with an IAM auth token. TRUNCATE and one
-aws_s3.table_import_from_s3 call per part run in one transaction per table, so
-a failed table keeps its previous rows.
+Aurora aws_s3 import requires and UNLOAD doesn't set, then refreshes the Aurora
+table with a blue-green swap. It creates a shadow table in the mart_stg schema
+from the job's DDL file, imports the parts into it with one
+aws_s3.table_import_from_s3 call per part, and builds its indexes and statistics.
+Then it drops the live mart table and moves the shadow table into mart. Each
+table is one transaction, so readers use the old table until the commit, and a
+failed table keeps its rows. The job reaches the private cluster through a Glue
+network connection in its VPC, and logs in over TLS with an IAM auth token.
 """
 
 from __future__ import annotations
@@ -78,6 +81,10 @@ except ModuleNotFoundError:  # pragma: no cover - lets unit tests import helpers
 BASE_NAME_DEFAULT = "spreadsheet__mart_tables"
 S3_MID_PATH_DEFAULT = f"orcaglue/{BASE_NAME_DEFAULT}/dev"
 SCHEMA_NAME = "mart"
+# The shadow tables are loaded here, where the API users can't see them, then moved into mart.
+STAGE_SCHEMA_NAME = "mart_stg"
+# The swap drops the old table with its grants, so each new table is granted SELECT to these.
+MART_READERS_DEFAULT = ("dbuser_ro",)
 DB_NAME_DEFAULT = "orcanexus"
 DB_USER_DEFAULT = "dbuser_rw"
 DB_PORT_DEFAULT = 5432
@@ -86,8 +93,8 @@ APPLICATION_NAME = "orcaglue-spreadsheet-mart-tables"
 SUMMARY_FILE_NAME = "orcanexus_mart_tables.manifest.json"
 MANIFEST_SUFFIX = "_manifest"
 
-# The mart tables unloaded from Redshift. Keep in sync with job/init.sql and the
-# mart-tables stack config.
+# The mart tables unloaded from Redshift. Keep in sync with job/mart_tables.json and
+# the mart-tables stack config.
 MART_TABLES_DEFAULT = (
     "bam",
     "em_library_aliases",
@@ -101,12 +108,18 @@ MART_TABLES_DEFAULT = (
     "workflow_output",
 )
 
-# Table and column names are lowercase identifiers that need no quoting. They are
-# validated before they are put into SQL.
-IDENTIFIER_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
+# Table, column, index and role names are lowercase identifiers of at most 63 bytes,
+# PostgreSQL's limit. They are validated before they are put into SQL.
+IDENTIFIER_PATTERN = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+# A column type in the DDL file, such as varchar(255), numeric(18,2) or double precision.
+TYPE_PATTERN = re.compile(r"^[a-z][a-z ]*[a-z](\(\d+(,\d+)?\))?$")
 IMPORTED_ROWS_PATTERN = re.compile(r"^(\d+) rows imported")
 
-LOCK_TIMEOUT = "30s"
+# The swap waits this long for readers of the live table to finish. Queries that arrive
+# meanwhile queue behind it, so the wait is short, and the swap is retried instead.
+LOCK_TIMEOUT = "5s"
+SWAP_ATTEMPTS = 6
+SWAP_RETRY_SECONDS = 10
 # The server ends any statement that runs longer than this. The socket timeout only
 # catches a dead connection, so it must be longer.
 STATEMENT_TIMEOUT = "10min"
@@ -115,17 +128,15 @@ WAKE_TIMEOUT_SECONDS = 180
 WAKE_INTERVAL_SECONDS = 10
 # SQLSTATE cannot_connect_now: the server is starting up, as when Aurora resumes.
 STARTING_UP_SQLSTATE = "57P03"
+# SQLSTATE lock_not_available: lock_timeout ran out.
+LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
 
 IMPORT_SQL = (
     "SELECT aws_s3.table_import_from_s3("
     ":table_name, :column_list, :options, "
     "aws_commons.create_s3_uri(:bucket, :key, :region)) AS result"
 )
-COLUMNS_SQL = (
-    "SELECT column_name FROM information_schema.columns "
-    "WHERE table_schema = :schema_name AND table_name = :table_name "
-    "ORDER BY ordinal_position"
-)
+EXISTS_SQL = "SELECT to_regclass(:table_name) IS NOT NULL AS present"
 
 
 @dataclass(frozen=True)
@@ -163,6 +174,29 @@ class AuroraLogin:
     port: int
     user: str
     database: str
+
+
+@dataclass(frozen=True)
+class TableSpec:
+    """A table from the DDL file: its columns in CSV header order, and its indexes."""
+
+    name: str
+    columns: tuple[tuple[str, str], ...]
+    indexes: tuple[tuple[str, ...], ...] = ()
+
+    @property
+    def column_names(self) -> list[str]:
+        return [name for name, _ in self.columns]
+
+
+@dataclass(frozen=True)
+class LoadOptions:
+    readers: tuple[str, ...] = MART_READERS_DEFAULT
+    null_marker: str = ""
+    allow_empty: bool = False
+
+
+LOAD_OPTIONS_DEFAULT = LoadOptions()
 
 
 class LoadError(RuntimeError):
@@ -203,18 +237,92 @@ def validate_identifier(name: str) -> str:
     return name
 
 
-def parse_tables(value: str | None) -> tuple[str, ...]:
-    if not value:
-        return MART_TABLES_DEFAULT
+def validate_type(data_type: str) -> str:
+    if not TYPE_PATTERN.fullmatch(data_type):
+        raise ValueError(f"Not a column type: {data_type!r}")
+    return data_type
 
-    tables = [table.strip() for table in value.split(",") if table.strip()]
-    if not tables:
-        raise ValueError("--mart_tables names no tables")
-    return tuple(dict.fromkeys(validate_identifier(table) for table in tables))
+
+def quote_identifier(name: str) -> str:
+    """Quote a column name. The Redshift columns include keywords, such as key and type."""
+    return f'"{validate_identifier(name)}"'
+
+
+def parse_names(
+    value: str | None, default: tuple[str, ...], option: str
+) -> tuple[str, ...]:
+    if not value:
+        return default
+
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    if not names:
+        raise ValueError(f"{option} names nothing")
+    return tuple(dict.fromkeys(validate_identifier(name) for name in names))
+
+
+def parse_tables(value: str | None) -> tuple[str, ...]:
+    return parse_names(value, MART_TABLES_DEFAULT, "--mart_tables")
+
+
+def parse_readers(value: str | None) -> tuple[str, ...]:
+    return parse_names(value, MART_READERS_DEFAULT, "--mart_readers")
 
 
 def qualified_name(table: str) -> str:
     return f"{SCHEMA_NAME}.{validate_identifier(table)}"
+
+
+def staged_name(table: str) -> str:
+    return f"{STAGE_SCHEMA_NAME}.{validate_identifier(table)}"
+
+
+def index_name(table: str, columns: tuple[str, ...]) -> str:
+    return f"{table}_{'_'.join(columns)}_idx"
+
+
+def parse_table_spec(table: str, spec: dict[str, Any]) -> TableSpec:
+    """Validate one table of the DDL file. Its names and types go into SQL as they are."""
+    columns = tuple(
+        (validate_identifier(name), validate_type(data_type))
+        for name, data_type in spec["columns"]
+    )
+    names = [name for name, _ in columns]
+    if not names or len(set(names)) != len(names):
+        raise ValueError(f"{table} needs columns with distinct names")
+
+    indexes = tuple(
+        tuple(validate_identifier(column) for column in index)
+        for index in spec.get("indexes", [])
+    )
+    for index in indexes:
+        if not index or not set(index) <= set(names):
+            raise ValueError(f"Index {list(index)} of {table} isn't on its columns")
+        validate_identifier(index_name(table, index))
+    return TableSpec(validate_identifier(table), columns, indexes)
+
+
+def parse_ddl(text: str) -> dict[str, TableSpec]:
+    """Read the DDL file, job/mart_tables.json, which `make ddl` generates."""
+    return {
+        table: parse_table_spec(table, spec)
+        for table, spec in json.loads(text)["tables"].items()
+    }
+
+
+def create_table_sql(spec: TableSpec) -> str:
+    columns = ", ".join(
+        f"{quote_identifier(name)} {data_type}" for name, data_type in spec.columns
+    )
+    return f"CREATE TABLE {staged_name(spec.name)} ({columns})"
+
+
+def create_index_sql(spec: TableSpec) -> list[str]:
+    """B-tree indexes, named for their columns. They move into mart with the table."""
+    return [
+        f"CREATE INDEX {index_name(spec.name, index)} ON {staged_name(spec.name)} "
+        f"({', '.join(quote_identifier(column) for column in index)})"
+        for index in spec.indexes
+    ]
 
 
 def get_boto3_client(service: str, config: Any = None):
@@ -241,8 +349,13 @@ def parse_s3_url(url: str) -> tuple[str, str]:
     return bucket, key
 
 
-def read_s3_text(s3: Any, url: str) -> str:
-    bucket, key = parse_s3_url(url)
+def read_text(s3: Any, location: str) -> str:
+    """Read an S3 object, or a local file in a local run."""
+    if not location.startswith("s3://"):
+        with open(location, encoding="utf-8") as handle:
+            return handle.read()
+
+    bucket, key = parse_s3_url(location)
     return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
 
 
@@ -446,18 +559,6 @@ def wait_for_aurora(
             sleep(interval_seconds)
 
 
-def table_columns(db: Database, table: str) -> list[str]:
-    rows = db.execute(
-        COLUMNS_SQL,
-        {"schema_name": SCHEMA_NAME, "table_name": validate_identifier(table)},
-    )
-    if not rows:
-        raise LoadError(
-            f"{qualified_name(table)} doesn't exist in Aurora. Run job/init.sql first."
-        )
-    return [validate_identifier(row["column_name"]) for row in rows]
-
-
 def import_options(null_marker: str = "") -> str:
     """The COPY options. HEADER MATCH fails if the CSV header and columns differ."""
     options = ["format csv", "header match"]
@@ -469,8 +570,9 @@ def import_options(null_marker: str = "") -> str:
 def import_parameters(
     table: str, columns: list[str], part: Part, null_marker: str = ""
 ) -> dict[str, str]:
+    """Import a part into the table's shadow table."""
     return {
-        "table_name": qualified_name(table),
+        "table_name": staged_name(table),
         "column_list": ",".join(columns),
         "options": import_options(null_marker),
         "bucket": part.bucket,
@@ -486,34 +588,78 @@ def parse_imported_rows(result: str) -> int:
     return int(match.group(1))
 
 
-def count_rows(db: Database, table: str) -> int:
-    rows = db.execute(f"SELECT count(*) AS row_count FROM {qualified_name(table)}")
+def count_rows(db: Database, name: str) -> int:
+    rows = db.execute(f"SELECT count(*) AS row_count FROM {name}")
     return int(rows[0]["row_count"])
+
+
+def table_exists(db: Database, name: str) -> bool:
+    return bool(db.execute(EXISTS_SQL, {"table_name": name})[0]["present"])
+
+
+def swap_in(
+    db: Database,
+    table: str,
+    attempts: int = SWAP_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Replace the live table with the shadow table, returning the attempt that did it.
+
+    The old table is dropped first, which frees its index names, then the shadow table
+    moves into mart with its indexes, statistics and grants. Both need the live table's
+    exclusive lock, which waits for the queries using it, up to LOCK_TIMEOUT. A timeout
+    rolls back to the savepoint and retries, without redoing the load.
+    """
+    live = qualified_name(table)
+    db.execute("SAVEPOINT swap")
+    for attempt in range(1, attempts + 1):
+        try:
+            db.execute(f"DROP TABLE IF EXISTS {live}")
+            db.execute(f"ALTER TABLE {staged_name(table)} SET SCHEMA {SCHEMA_NAME}")
+            return attempt
+        except DatabaseError as error:
+            if sqlstate(error) != LOCK_NOT_AVAILABLE_SQLSTATE or attempt == attempts:
+                raise
+            db.execute("ROLLBACK TO SAVEPOINT swap")
+            print(
+                f"Readers held {live} for {LOCK_TIMEOUT}; retrying the swap in "
+                f"{SWAP_RETRY_SECONDS}s ({attempt} of {attempts})"
+            )
+            sleep(SWAP_RETRY_SECONDS)
+    raise ValueError(f"attempts must be at least 1, not {attempts}")
 
 
 def load_table(
     db: Database,
-    table: str,
-    columns: list[str],
+    spec: TableSpec,
     parts: tuple[Part, ...],
     result: TableResult,
-    null_marker: str = "",
-    allow_empty: bool = False,
+    options: LoadOptions = LOAD_OPTIONS_DEFAULT,
     monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    """Replace the table with the parts in one transaction, then analyze it."""
-    name = qualified_name(table)
+    """Load the parts into a shadow table, then swap it in for the live table.
+
+    It is one transaction, so no other session sees the shadow table, and an error
+    leaves nothing behind. Until the swap, the live table is only read, so the API's
+    queries carry on. The swap holds the live table's lock from the drop to the commit,
+    a few milliseconds.
+    """
+    table = spec.name
+    live, stage = qualified_name(table), staged_name(table)
     db.begin()
     try:
         db.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
-        result.rows_before = count_rows(db, table)
-        db.execute(f"TRUNCATE TABLE {name}")
+        # A swap moves the shadow table out, so one here was left by hand.
+        db.execute(f"DROP TABLE IF EXISTS {stage}")
+        db.execute(create_table_sql(spec))
 
         imported = 0
         for part in parts:
             started = monotonic()
             rows = db.execute(
-                IMPORT_SQL, import_parameters(table, columns, part, null_marker)
+                IMPORT_SQL,
+                import_parameters(table, spec.column_names, part, options.null_marker),
             )
             part_rows = parse_imported_rows(rows[0]["result"] if rows else "")
             imported += part_rows
@@ -522,32 +668,39 @@ def load_table(
                 f"in {monotonic() - started:.1f}s"
             )
 
-        rows_after = count_rows(db, table)
+        rows_after = count_rows(db, stage)
         if rows_after != imported:
-            raise LoadError(f"{name} has {rows_after} rows after importing {imported}")
-        if rows_after == 0 and result.rows_before and not allow_empty:
+            raise LoadError(f"{stage} has {rows_after} rows after importing {imported}")
+        result.rows_before = count_rows(db, live) if table_exists(db, live) else None
+        if rows_after == 0 and result.rows_before and not options.allow_empty:
             raise LoadError(
-                f"{name} would go from {result.rows_before} rows to 0. "
+                f"{live} would go from {result.rows_before} rows to 0. "
                 "Check the unload, or rerun with --allow_empty true."
             )
+
+        # Built after the load, which is faster than keeping them up to date during it.
+        # The statistics are ready before the first query of the new table.
+        for sql in create_index_sql(spec):
+            db.execute(sql)
+        db.execute(f"ANALYZE {stage}")
+        for reader in options.readers:
+            db.execute(f"GRANT SELECT ON {stage} TO {validate_identifier(reader)}")
+
+        attempt = swap_in(db, table, sleep=sleep)
         db.commit()
     except Exception:
         try:
             db.rollback()
         except (DatabaseError, InterfaceError, OSError) as rollback_error:
             # Keep the original error. The server rolls back when the session ends.
-            print(f"Rollback of {name} failed: {describe_error(rollback_error)}")
+            print(f"Rollback of {live} failed: {describe_error(rollback_error)}")
         raise
 
     result.rows_after = rows_after
-    print(f"Loaded {name}: {result.rows_before} -> {rows_after} rows")
-    try:
-        db.execute(f"ANALYZE {name}")
-    except (DatabaseError, InterfaceError, OSError) as error:
-        # The rows are committed. Stale statistics only slow queries until autovacuum runs.
-        print(
-            f"WARNING: ANALYZE {name} failed; the load is kept: {describe_error(error)}"
-        )
+    before = "new table" if result.rows_before is None else result.rows_before
+    print(
+        f"Loaded {live}: {before} -> {rows_after} rows, swapped in on attempt {attempt}"
+    )
 
 
 def process_table(
@@ -556,13 +709,17 @@ def process_table(
     bucket: str,
     prefix: str,
     table: str,
+    specs: dict[str, TableSpec],
     dry_run: bool,
-    null_marker: str = "",
-    allow_empty: bool = False,
+    options: LoadOptions = LOAD_OPTIONS_DEFAULT,
 ) -> TableResult:
     """Prepare one table's parts and load them, returning the outcome."""
     result = TableResult(table=table)
     try:
+        if table not in specs:
+            raise LoadError(
+                f"The DDL file has no {table} table. Add it with `make ddl`."
+            )
         manifest = read_manifest(s3, bucket, prefix, table)
         result.manifest = f"s3://{bucket}/{manifest.key}"
         result.manifest_last_modified = manifest.last_modified
@@ -580,10 +737,7 @@ def process_table(
         # A session per table, so a dropped connection fails only that table.
         db = connect_db()
         try:
-            columns = table_columns(db, table)
-            load_table(
-                db, table, columns, manifest.parts, result, null_marker, allow_empty
-            )
+            load_table(db, specs[table], manifest.parts, result, options)
         finally:
             db.close()
         result.status = "loaded"
@@ -630,11 +784,11 @@ def load_marts(
     source_bucket: str,
     source_prefix: str,
     tables: tuple[str, ...],
+    specs: dict[str, TableSpec],
     lz_bucket: str,
     s3_mid_path: str,
     dry_run: bool,
-    null_marker: str = "",
-    allow_empty: bool = False,
+    options: LoadOptions = LOAD_OPTIONS_DEFAULT,
 ) -> list[TableResult]:
     """Load every table, upload the summary, and raise if any table failed."""
     if connect_db is not None and not dry_run:
@@ -647,9 +801,9 @@ def load_marts(
             source_bucket,
             source_prefix,
             table,
+            specs,
             dry_run,
-            null_marker,
-            allow_empty,
+            options,
         )
         for table in tables
     ]
@@ -693,6 +847,7 @@ class GlueSpreadsheetMartTables(GlueJobBase):
             "lz_bucket",
             "source_bucket",
             "source_prefix",
+            "mart_ddl",
         ]
 
         optional = [
@@ -705,6 +860,7 @@ class GlueSpreadsheetMartTables(GlueJobBase):
             "aurora_database",
             "aurora_ca_bundle",
             "mart_tables",
+            "mart_readers",
             "null_marker",
             "allow_empty",
             "dry_run",
@@ -716,9 +872,13 @@ class GlueSpreadsheetMartTables(GlueJobBase):
         self.lz_bucket = args["lz_bucket"]
         self.source_bucket = args["source_bucket"]
         self.source_prefix = args["source_prefix"]
+        self.mart_ddl = args["mart_ddl"]
         self.tables = parse_tables(args.get("mart_tables"))
-        self.null_marker = args.get("null_marker", "")
-        self.allow_empty = parse_bool(args.get("allow_empty"))
+        self.options = LoadOptions(
+            readers=parse_readers(args.get("mart_readers")),
+            null_marker=args.get("null_marker", ""),
+            allow_empty=parse_bool(args.get("allow_empty")),
+        )
         self.dry_run = parse_bool(args.get("dry_run"))
         self.s3_mid_path = args.get("s3_mid_path", S3_MID_PATH_DEFAULT)
 
@@ -742,11 +902,13 @@ class GlueSpreadsheetMartTables(GlueJobBase):
 
     def run(self) -> None:
         s3 = get_boto3_client("s3")
+        # A dry run reads the DDL file too, so it catches a table the file lacks.
+        specs = parse_ddl(read_text(s3, self.mart_ddl))
         connect_db = None
         if self.login is None:
             print("Dry run enabled: skipping the Aurora load")
         else:
-            ssl_context = tls_context(read_s3_text(s3, self.ca_bundle))
+            ssl_context = tls_context(read_text(s3, self.ca_bundle))
             connect_db = functools.partial(connect, self.login, ssl_context)
 
         load_marts(
@@ -755,11 +917,11 @@ class GlueSpreadsheetMartTables(GlueJobBase):
             source_bucket=self.source_bucket,
             source_prefix=self.source_prefix,
             tables=self.tables,
+            specs=specs,
             lz_bucket=self.lz_bucket,
             s3_mid_path=self.s3_mid_path,
             dry_run=self.dry_run,
-            null_marker=self.null_marker,
-            allow_empty=self.allow_empty,
+            options=self.options,
         )
         self.commit()
 

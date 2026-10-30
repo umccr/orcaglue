@@ -5,7 +5,7 @@ install:
 
 # targets inside Docker container
 
-.PHONY: install cwd run-dry test wheels ca-bundle init-sql
+.PHONY: install cwd run-dry test wheels ca-bundle ddl
 
 include ../local.mk
 
@@ -24,6 +24,7 @@ run-dry: debug cwd
 		--s3_mid_path "orcaglue/spreadsheet__mart_tables/dev" \
 		--source_bucket "orcavault-dev-warehouse-115253169271-ap-southeast-2-an" \
 		--source_prefix "v1/csv/mart/" \
+		--mart_ddl job/mart_tables.json \
 		--mart_tables "$(mart_tables)" \
 		--dry_run true
 
@@ -42,11 +43,11 @@ ca-bundle:
 	curl -fsSL https://truststore.pki.rds.amazonaws.com/ap-southeast-2/ap-southeast-2-bundle.pem \
 		-o job/rds-ca-ap-southeast-2-bundle.pem
 
-# Regenerate job/init.sql from the Redshift dev mart columns. Runs on the host, with an
-# AWS session that can read the Redshift admin secret.
-init-sql:
-	$(PYTHON) job/generate_init_sql.py \
+# Regenerate the columns in job/mart_tables.json from the Redshift dev mart, keeping its
+# indexes. Runs on the host, with an AWS session that can read the Redshift admin secret.
+ddl:
+	$(PYTHON) job/generate_mart_ddl.py \
 		--workgroup orcahouse-dev \
 		--secret-arn 'redshift!orcahouse-dev-admin' \
 		--tables "$(mart_tables)" \
-		--output job/init.sql
+		--output job/mart_tables.json

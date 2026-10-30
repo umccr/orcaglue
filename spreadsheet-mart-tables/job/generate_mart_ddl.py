@@ -1,24 +1,27 @@
-"""Generate job/init.sql, the Aurora mart DDL, from the Redshift mart columns.
+"""Generate job/mart_tables.json, the Aurora mart DDL, from the Redshift mart columns.
 
-The Aurora mart tables mirror the Redshift mart tables column for column, so the
-DDL is generated from the Redshift catalog (svv_columns). The output is reviewed,
-committed, and run by hand as the Aurora master user. It isn't run by the job.
+The Aurora mart tables mirror the Redshift mart tables column for column, so their
+columns are generated from the Redshift catalog (svv_columns). The job creates each
+table from this file at every run, so a reviewed and deployed change reaches Aurora at
+the next swap. Indexes are added by hand, as lists of column names, and regenerating
+keeps them.
 
 Run from the module root with an AWS session that can query the workgroup:
 
-    python job/generate_init_sql.py --workgroup orcahouse-dev \\
-        --secret-arn 'redshift!orcahouse-dev-admin' --output job/init.sql
+    python job/generate_mart_ddl.py --workgroup orcahouse-dev \\
+        --secret-arn 'redshift!orcahouse-dev-admin' --output job/mart_tables.json
 
-or `make init-sql`. Without --secret-arn, the caller's IAM identity is used, which
+or `make ddl`. Without --secret-arn, the caller's IAM identity is used, which
 only sees the mart tables it has privileges on.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,9 +29,11 @@ from spreadsheet_mart_tables import (
     MART_TABLES_DEFAULT,
     REGION_NAME,
     SCHEMA_NAME,
+    TableSpec,
     get_boto3_client,
+    parse_ddl,
+    parse_table_spec,
     parse_tables,
-    validate_identifier,
 )
 
 COLUMNS_SQL = f"""SELECT
@@ -60,6 +65,12 @@ TYPE_NAMES = {
 STATEMENT_TIMEOUT_SECONDS = 5 * 60
 POLL_INTERVAL_SECONDS = 2
 
+ABOUT = (
+    "The Aurora mart tables, which the spreadsheet-mart-tables job creates at every run. "
+    "The columns are generated from the Redshift mart by `make ddl`; don't edit them. "
+    "The indexes are edited by hand, as lists of column names, and `make ddl` keeps them."
+)
+
 
 @dataclass(frozen=True)
 class Column:
@@ -82,60 +93,53 @@ def pg_type(column: Column) -> str:
         return TYPE_NAMES[column.data_type]
     raise ValueError(
         f"No PostgreSQL type for Redshift column {column.name} ({column.data_type}). "
-        "Add one to generate_init_sql.py, and check that the CSV unload of it imports."
+        "Add one to generate_mart_ddl.py, and check that the CSV unload of it imports."
     )
 
 
-def quote_identifier(name: str) -> str:
-    return f'"{validate_identifier(name)}"'
-
-
-def ddl_for(table: str, columns: list[Column]) -> str:
-    """DROP and CREATE TABLE for one mart table, columns in Redshift order."""
-    name = f"{SCHEMA_NAME}.{validate_identifier(table)}"
-    quoted = [quote_identifier(column.name) for column in columns]
-    width = max(len(column) for column in quoted)
-    lines = ",\n".join(
-        f"    {column.ljust(width)} {pg_type(spec)}"
-        for column, spec in zip(quoted, columns, strict=True)
+def table_spec(
+    table: str, columns: list[Column], indexes: Iterable[tuple[str, ...]] = ()
+) -> TableSpec:
+    """One table's DDL: the Redshift columns in order, with PostgreSQL types."""
+    return parse_table_spec(
+        table,
+        {
+            "columns": [(column.name, pg_type(column)) for column in columns],
+            "indexes": list(indexes),
+        },
     )
-    return f"DROP TABLE IF EXISTS {name};\n\nCREATE TABLE {name}\n(\n{lines}\n);"
 
 
-def init_sql(tables: dict[str, list[Column]], source: str) -> str:
-    header = f"""--
--- init.sql
---
--- README:
---   The Aurora PostgreSQL DDL for the spreadsheet-mart-tables load target, the
---   {SCHEMA_NAME} schema of the orcanexus database. Generated from the Redshift mart
---   columns (svv_columns) by job/generate_init_sql.py, see `make init-sql`.
---   Do not edit it by hand. Regenerate it when a mart's columns change.
---
---   Run it as the Aurora master user (sadmin) in the orcanexus database, after
---   orcahouse infra/aurora/dba/04_rw.sql has created dbuser_rw, and before the
---   first Glue load.
---
---   It drops and recreates every table, which deletes the loaded rows. Don't
---   run it while the Glue job or the OrcaNexus API is using the tables. The next
---   Glue run reloads them.
---
---   Generated from: {source}.
---
-
-CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};
-"""
-    tables_ddl = "\n\n".join(
-        ddl_for(table, columns) for table, columns in tables.items()
+def render_ddl(specs: dict[str, TableSpec], source: str) -> str:
+    """The DDL file, with a column per line so a mart change reads well in a diff."""
+    tables = []
+    for spec in specs.values():
+        columns = ",\n".join(
+            f"        {json.dumps(list(column))}" for column in spec.columns
+        )
+        indexes = json.dumps([list(index) for index in spec.indexes])
+        tables.append(
+            f"    {json.dumps(spec.name)}: {{\n"
+            f'      "columns": [\n{columns}\n      ],\n'
+            f'      "indexes": {indexes}\n'
+            "    }"
+        )
+    return (
+        "{\n"
+        f'  "about": {json.dumps(ABOUT)},\n'
+        f'  "source": {json.dumps(source)},\n'
+        '  "tables": {\n' + ",\n".join(tables) + "\n  }\n}\n"
     )
-    footer = f"""-- The sadmin default privileges cover these. The grants make the script work
--- whoever runs it.
-GRANT SELECT ON ALL TABLES IN SCHEMA {SCHEMA_NAME} TO dbuser_ro;
-GRANT SELECT, INSERT, TRUNCATE, MAINTAIN ON ALL TABLES IN SCHEMA {SCHEMA_NAME} TO dbuser_rw;
 
-SELECT '{SCHEMA_NAME} tables ready' AS status;
-"""
-    return f"{header}\n{tables_ddl}\n\n{footer}"
+
+def read_indexes(path: str) -> dict[str, tuple[tuple[str, ...], ...]]:
+    """The hand-written indexes of an existing DDL file, to keep them."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            specs = parse_ddl(handle.read())
+    except FileNotFoundError:
+        return {}
+    return {table: spec.indexes for table, spec in specs.items()}
 
 
 def field_value(field: dict[str, Any]) -> Any:
@@ -207,16 +211,21 @@ def main() -> int:
         print(f"Not in Redshift {SCHEMA_NAME}: {', '.join(missing)}", file=sys.stderr)
         return 1
 
-    sql = init_sql(
-        {table: columns[table] for table in tables},
+    # An index on a column that Redshift dropped fails here, to be fixed by hand.
+    indexes = read_indexes(args.output) if args.output else {}
+    text = render_ddl(
+        {
+            table: table_spec(table, columns[table], indexes.get(table, ()))
+            for table in tables
+        },
         source=f"Redshift workgroup {args.workgroup}, database {args.database}, region {REGION_NAME}",
     )
     if args.output:
         with open(args.output, "w", newline="") as handle:
-            handle.write(sql)
+            handle.write(text)
         print(f"Wrote {args.output}", file=sys.stderr)
     else:
-        sys.stdout.write(sql)
+        sys.stdout.write(text)
     return 0
 
 

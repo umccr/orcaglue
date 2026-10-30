@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-import generate_init_sql as ddl
+import generate_mart_ddl as ddl
 import pytest
 import spreadsheet_mart_tables as job
 from botocore.exceptions import ClientError
@@ -14,7 +14,18 @@ from botocore.exceptions import ClientError
 BUCKET = "orcavault-dev-warehouse-115253169271-ap-southeast-2-an"
 PREFIX = "v1/csv/mart/"
 LZ_BUCKET = "orcahouse-dev-landing-zone-115253169271-ap-southeast-2-an"
-LIMS_COLUMNS = ["sequencing_run_id", "library_id", "load_datetime"]
+LIMS = job.TableSpec(
+    "lims",
+    (
+        ("sequencing_run_id", "varchar(255)"),
+        ("library_id", "varchar(255)"),
+        ("load_datetime", "timestamptz"),
+    ),
+    (("sequencing_run_id",),),
+)
+SPECS = {"lims": LIMS}
+LIMS_COLUMNS = LIMS.column_names
+DDL_FILE = Path(__file__).with_name("mart_tables.json")
 CA_BUNDLE = Path(__file__).with_name("rds-ca-ap-southeast-2-bundle.pem")
 LOGIN = job.AuroraLogin(
     host="orcanexus-dev.cluster-cpyama2ogufr.ap-southeast-2.rds.amazonaws.com",
@@ -105,13 +116,17 @@ class FakeS3:
 
 
 class FakeConnection:
-    """Answers the job's SQL like a pg8000 native connection, and records it."""
+    """Answers the job's SQL like a pg8000 native connection, and records it.
 
-    def __init__(self, counts=(5, 3), imported=(2, 1), fail_on=None, columns=None):
+    counts are the row counts of the shadow table, then of the live table. errors maps
+    the start of a statement to the SQLSTATEs it raises, one per run of it, in turn.
+    """
+
+    def __init__(self, counts=(3, 5), imported=(2, 1), live=True, errors=None):
         self.counts = list(counts)
         self.imported = list(imported)
-        self.fail_on = fail_on
-        self.table_columns = LIMS_COLUMNS if columns is None else columns
+        self.live = live
+        self.errors = {sql: list(codes) for sql, codes in (errors or {}).items()}
         self.statements = []
         self.columns = None
         self.closed = False
@@ -119,12 +134,13 @@ class FakeConnection:
     def run(self, sql, **params):
         self.statements.append((sql, params))
         self.columns = None
-        if self.fail_on and self.fail_on in sql:
-            raise database_error("XX000")
-        if sql == job.COLUMNS_SQL:
-            return self.answer("column_name", [[name] for name in self.table_columns])
+        for start, codes in self.errors.items():
+            if sql.startswith(start) and codes:
+                raise database_error(codes.pop(0))
         if sql.startswith("SELECT count(*)"):
             return self.answer("row_count", [[self.counts.pop(0)]])
+        if sql == job.EXISTS_SQL:
+            return self.answer("present", [[self.live]])
         if sql == job.IMPORT_SQL:
             result = f"{self.imported.pop(0)} rows imported into relation"
             return self.answer("result", [[result]])
@@ -148,11 +164,19 @@ def parts(*sizes: int) -> tuple[job.Part, ...]:
     )
 
 
-def test_parse_tables_defaults_and_validates():
+def ddl_text(**tables) -> str:
+    return json.dumps({"tables": tables})
+
+
+def test_parse_names_default_and_validate():
     assert job.parse_tables(None) == job.MART_TABLES_DEFAULT
     assert job.parse_tables(" lims, fastq ,lims") == ("lims", "fastq")
+    assert job.parse_readers(None) == ("dbuser_ro",)
+    assert job.parse_readers("dbuser_ro,api_ro") == ("dbuser_ro", "api_ro")
     with pytest.raises(ValueError, match="identifier"):
         job.parse_tables("lims;drop table x")
+    with pytest.raises(ValueError, match="identifier"):
+        job.parse_readers("public to dbuser_rw")
 
 
 def test_read_manifest_skips_empty_parts():
@@ -200,17 +224,61 @@ def test_import_options_match_the_header_and_escape_the_null_marker():
     assert job.import_options("it's") == "(format csv, header match, null 'it''s')"
 
 
-def test_import_parameters_name_the_part_and_columns():
+def test_import_parameters_load_the_shadow_table():
     part = job.Part(BUCKET, f"{PREFIX}lims/lims_0000_part_00.gz", 10)
 
     assert job.import_parameters("lims", LIMS_COLUMNS, part) == {
-        "table_name": "mart.lims",
+        "table_name": "mart_stg.lims",
         "column_list": "sequencing_run_id,library_id,load_datetime",
         "options": "(format csv, header match)",
         "bucket": BUCKET,
         "key": f"{PREFIX}lims/lims_0000_part_00.gz",
         "region": "ap-southeast-2",
     }
+
+
+def test_parse_ddl_reads_the_columns_and_indexes():
+    text = ddl_text(
+        lims={
+            "columns": [list(column) for column in LIMS.columns],
+            "indexes": [["sequencing_run_id"]],
+        }
+    )
+
+    assert job.parse_ddl(text) == SPECS
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        ({"columns": []}, "distinct names"),
+        ({"columns": [["a", "text"], ["a", "text"]]}, "distinct names"),
+        ({"columns": [["A", "text"]]}, "identifier"),
+        ({"columns": [["a", "text); drop table x; --"]]}, "Not a column type"),
+        ({"columns": [["a", "text"]], "indexes": [["b"]]}, "isn't on its columns"),
+        ({"columns": [["a", "text"]], "indexes": [[]]}, "isn't on its columns"),
+        # The index name, t_<60 a>_idx, is longer than PostgreSQL's 63 bytes.
+        ({"columns": [["a" * 60, "text"]], "indexes": [["a" * 60]]}, "identifier"),
+    ],
+)
+def test_parse_ddl_rejects_a_bad_table(spec, message):
+    with pytest.raises(ValueError, match=message):
+        job.parse_ddl(ddl_text(t=spec))
+
+
+def test_create_table_and_index_sql_build_the_shadow_table():
+    pair = job.TableSpec("t", (("a", "text"), ("b", "numeric(18,2)")), (("a", "b"),))
+
+    assert job.create_table_sql(LIMS) == (
+        'CREATE TABLE mart_stg.lims ("sequencing_run_id" varchar(255), '
+        '"library_id" varchar(255), "load_datetime" timestamptz)'
+    )
+    assert job.create_index_sql(LIMS) == [
+        'CREATE INDEX lims_sequencing_run_id_idx ON mart_stg.lims ("sequencing_run_id")'
+    ]
+    assert job.create_index_sql(pair) == [
+        'CREATE INDEX t_a_b_idx ON mart_stg.t ("a", "b")'
+    ]
 
 
 def test_tls_context_trusts_only_the_rds_cas_and_checks_the_host_name():
@@ -228,11 +296,14 @@ def test_tls_context_trusts_only_the_rds_cas_and_checks_the_host_name():
     ]
 
 
-def test_read_s3_text_reads_the_ca_bundle():
+def test_read_text_reads_s3_or_a_local_file(tmp_path):
     s3 = FakeS3()
     s3.add("orcaglue/x/dev/rds-ca.pem", b"pem")
+    local = tmp_path / "mart_tables.json"
+    local.write_text("{}", encoding="utf-8")
 
-    assert job.read_s3_text(s3, f"s3://{LZ_BUCKET}/orcaglue/x/dev/rds-ca.pem") == "pem"
+    assert job.read_text(s3, f"s3://{LZ_BUCKET}/orcaglue/x/dev/rds-ca.pem") == "pem"
+    assert job.read_text(s3, str(local)) == "{}"
 
 
 def test_iam_auth_token_is_for_the_login(monkeypatch):
@@ -284,16 +355,13 @@ def test_connect_logs_in_over_tls_with_a_new_token(monkeypatch):
 
 
 def test_database_returns_rows_as_dicts():
-    db = job.Database(FakeConnection())
+    db = job.Database(FakeConnection(live=False))
 
-    rows = db.execute(job.COLUMNS_SQL, {"schema_name": "mart", "table_name": "lims"})
+    rows = db.execute(job.EXISTS_SQL, {"table_name": "mart.lims"})
 
-    assert rows == [{"column_name": name} for name in LIMS_COLUMNS]
-    assert db.connection.statements[0][1] == {
-        "schema_name": "mart",
-        "table_name": "lims",
-    }
-    assert db.execute("TRUNCATE TABLE mart.lims") == []
+    assert rows == [{"present": False}]
+    assert db.connection.statements[0][1] == {"table_name": "mart.lims"}
+    assert db.execute("ANALYZE mart_stg.lims") == []
 
 
 def test_database_close_tolerates_a_dropped_connection(capsys):
@@ -328,79 +396,161 @@ def test_describe_error_gives_a_server_error_as_its_sqlstate_and_message():
     )
 
 
-def test_load_table_replaces_rows_in_one_transaction():
-    db = job.Database(FakeConnection(counts=(5, 3), imported=(2, 1)))
+def test_load_table_swaps_in_a_shadow_table_in_one_transaction():
+    db = job.Database(FakeConnection(counts=(3, 5), imported=(2, 1)))
     result = job.TableResult("lims")
 
-    job.load_table(db, "lims", LIMS_COLUMNS, parts(10, 20), result)
+    job.load_table(db, LIMS, parts(10, 20), result)
 
     assert db.connection.sql() == [
         "BEGIN",
-        "SET LOCAL lock_timeout = '30s'",
-        "SELECT count(*) AS row_count FROM mart.lims",
-        "TRUNCATE TABLE mart.lims",
+        "SET LOCAL lock_timeout = '5s'",
+        "DROP TABLE IF EXISTS mart_stg.lims",
+        job.create_table_sql(LIMS),
         job.IMPORT_SQL,
         job.IMPORT_SQL,
+        "SELECT count(*) AS row_count FROM mart_stg.lims",
+        job.EXISTS_SQL,
         "SELECT count(*) AS row_count FROM mart.lims",
+        *job.create_index_sql(LIMS),
+        "ANALYZE mart_stg.lims",
+        "GRANT SELECT ON mart_stg.lims TO dbuser_ro",
+        "SAVEPOINT swap",
+        "DROP TABLE IF EXISTS mart.lims",
+        "ALTER TABLE mart_stg.lims SET SCHEMA mart",
         "COMMIT",
-        "ANALYZE mart.lims",
     ]
     assert db.connection.statements[4][1] == job.import_parameters(
         "lims", LIMS_COLUMNS, parts(10, 20)[0]
     )
+    assert db.connection.statements[7][1] == {"table_name": "mart.lims"}
     assert (result.rows_before, result.rows_after) == (5, 3)
 
 
-def test_load_table_keeps_the_load_when_analyze_fails(capsys):
-    db = job.Database(FakeConnection(counts=(5, 3), imported=(2, 1), fail_on="ANALYZE"))
+def test_load_table_creates_the_live_table_on_the_first_load(capsys):
+    db = job.Database(FakeConnection(counts=(3,), live=False))
     result = job.TableResult("lims")
 
-    job.load_table(db, "lims", LIMS_COLUMNS, parts(10, 20), result)
+    job.load_table(db, LIMS, parts(10, 20), result)
 
-    assert "COMMIT" in db.connection.sql()
+    assert "SELECT count(*) AS row_count FROM mart.lims" not in db.connection.sql()
+    assert db.connection.sql()[-3:] == [
+        "DROP TABLE IF EXISTS mart.lims",
+        "ALTER TABLE mart_stg.lims SET SCHEMA mart",
+        "COMMIT",
+    ]
+    assert (result.rows_before, result.rows_after) == (None, 3)
+    assert "Loaded mart.lims: new table -> 3 rows, swapped in on attempt 1" in (
+        capsys.readouterr().out
+    )
+
+
+def test_load_table_grants_select_to_each_reader():
+    db = job.Database(FakeConnection())
+    options = job.LoadOptions(readers=("dbuser_ro", "api_ro"))
+
+    job.load_table(db, LIMS, parts(10, 20), job.TableResult("lims"), options)
+
+    assert [sql for sql in db.connection.sql() if sql.startswith("GRANT")] == [
+        "GRANT SELECT ON mart_stg.lims TO dbuser_ro",
+        "GRANT SELECT ON mart_stg.lims TO api_ro",
+    ]
+
+
+def test_load_table_retries_the_swap_while_readers_hold_the_table():
+    timeouts = [job.LOCK_NOT_AVAILABLE_SQLSTATE] * 2
+    db = job.Database(
+        FakeConnection(errors={"DROP TABLE IF EXISTS mart.lims": timeouts})
+    )
+    sleeps = []
+    result = job.TableResult("lims")
+
+    job.load_table(db, LIMS, parts(10, 20), result, sleep=sleeps.append)
+
+    assert db.connection.sql()[-8:] == [
+        "SAVEPOINT swap",
+        "DROP TABLE IF EXISTS mart.lims",
+        "ROLLBACK TO SAVEPOINT swap",
+        "DROP TABLE IF EXISTS mart.lims",
+        "ROLLBACK TO SAVEPOINT swap",
+        "DROP TABLE IF EXISTS mart.lims",
+        "ALTER TABLE mart_stg.lims SET SCHEMA mart",
+        "COMMIT",
+    ]
+    assert sleeps == [job.SWAP_RETRY_SECONDS] * 2
+    # The savepoint keeps the load, so a retry doesn't import again.
+    assert db.connection.sql().count(job.IMPORT_SQL) == 2
     assert result.rows_after == 3
-    assert "WARNING: ANALYZE mart.lims failed" in capsys.readouterr().out
+
+
+def test_load_table_gives_up_the_swap_and_rolls_back():
+    timeouts = [job.LOCK_NOT_AVAILABLE_SQLSTATE] * job.SWAP_ATTEMPTS
+    db = job.Database(
+        FakeConnection(errors={"DROP TABLE IF EXISTS mart.lims": timeouts})
+    )
+    sleeps = []
+
+    with pytest.raises(job.DatabaseError) as raised:
+        job.load_table(
+            db, LIMS, parts(10, 20), job.TableResult("lims"), sleep=sleeps.append
+        )
+
+    assert job.sqlstate(raised.value) == job.LOCK_NOT_AVAILABLE_SQLSTATE
+    assert len(sleeps) == job.SWAP_ATTEMPTS - 1
+    assert db.connection.sql()[-1] == "ROLLBACK"
+    assert "COMMIT" not in db.connection.sql()
+
+
+def test_load_table_does_not_retry_other_swap_errors():
+    # 2BP01 dependent_objects_still_exist, as for a view on the live table
+    db = job.Database(
+        FakeConnection(errors={"DROP TABLE IF EXISTS mart.lims": ["2BP01"]})
+    )
+    sleeps = []
+
+    with pytest.raises(job.DatabaseError):
+        job.load_table(
+            db, LIMS, parts(10, 20), job.TableResult("lims"), sleep=sleeps.append
+        )
+
+    assert sleeps == []
+    assert db.connection.sql()[-1] == "ROLLBACK"
 
 
 def test_load_table_rolls_back_when_counts_differ():
-    db = job.Database(FakeConnection(counts=(5, 4), imported=(2, 1)))
+    db = job.Database(FakeConnection(counts=(4,), imported=(2, 1)))
 
-    with pytest.raises(job.LoadError, match="4 rows after importing 3"):
-        job.load_table(db, "lims", LIMS_COLUMNS, parts(10, 20), job.TableResult("lims"))
+    with pytest.raises(
+        job.LoadError, match="mart_stg.lims has 4 rows after importing 3"
+    ):
+        job.load_table(db, LIMS, parts(10, 20), job.TableResult("lims"))
 
     assert db.connection.sql()[-1] == "ROLLBACK"
-    assert "COMMIT" not in db.connection.sql()
-    assert "ANALYZE mart.lims" not in db.connection.sql()
+    assert "SAVEPOINT swap" not in db.connection.sql()
 
 
 def test_load_table_rolls_back_when_an_import_fails():
-    db = job.Database(FakeConnection(fail_on="aws_s3.table_import_from_s3"))
+    db = job.Database(FakeConnection(errors={job.IMPORT_SQL: ["XX000"]}))
 
     with pytest.raises(job.DatabaseError):
-        job.load_table(db, "lims", LIMS_COLUMNS, parts(10), job.TableResult("lims"))
+        job.load_table(db, LIMS, parts(10), job.TableResult("lims"))
 
     assert db.connection.sql()[-1] == "ROLLBACK"
     assert "COMMIT" not in db.connection.sql()
 
 
 def test_load_table_refuses_to_empty_a_table_unless_allowed():
-    db = job.Database(FakeConnection(counts=(5, 0), imported=()))
+    db = job.Database(FakeConnection(counts=(0, 5), imported=()))
     with pytest.raises(job.LoadError, match="from 5 rows to 0"):
-        job.load_table(db, "lims", LIMS_COLUMNS, (), job.TableResult("lims"))
+        job.load_table(db, LIMS, (), job.TableResult("lims"))
     assert db.connection.sql()[-1] == "ROLLBACK"
+    assert "SAVEPOINT swap" not in db.connection.sql()
 
-    db = job.Database(FakeConnection(counts=(5, 0), imported=()))
+    db = job.Database(FakeConnection(counts=(0, 5), imported=()))
     result = job.TableResult("lims")
-    job.load_table(db, "lims", LIMS_COLUMNS, (), result, allow_empty=True)
-    assert "COMMIT" in db.connection.sql()
-    assert result.rows_after == 0
-
-
-def test_table_columns_requires_the_table():
-    assert job.table_columns(job.Database(FakeConnection()), "lims") == LIMS_COLUMNS
-
-    with pytest.raises(job.LoadError, match="Run job/init.sql"):
-        job.table_columns(job.Database(FakeConnection(columns=[])), "lims")
+    job.load_table(db, LIMS, (), result, job.LoadOptions(allow_empty=True))
+    assert db.connection.sql()[-1] == "COMMIT"
+    assert (result.rows_before, result.rows_after) == (5, 0)
 
 
 def failing_connect(*errors: Exception):
@@ -451,7 +601,15 @@ def test_dry_run_prepares_parts_without_touching_aurora():
     s3.add_table("new_mart")
 
     results = job.load_marts(
-        s3, None, BUCKET, PREFIX, ("lims",), LZ_BUCKET, "orcaglue/x/dev", dry_run=True
+        s3,
+        None,
+        BUCKET,
+        PREFIX,
+        ("lims",),
+        SPECS,
+        LZ_BUCKET,
+        "orcaglue/x/dev",
+        dry_run=True,
     )
 
     assert [
@@ -467,6 +625,7 @@ def test_dry_run_prepares_parts_without_touching_aurora():
 def test_load_marts_attempts_every_table_then_fails():
     s3 = FakeS3()
     s3.add_table("lims", sizes=(10, 20))
+    specs = {**SPECS, "fastq": job.TableSpec("fastq", (("library_id", "text"),))}
     connect_db, connections = failing_connect()
 
     with pytest.raises(RuntimeError, match="1 of 2 mart tables failed: fastq"):
@@ -476,6 +635,7 @@ def test_load_marts_attempts_every_table_then_fails():
             BUCKET,
             PREFIX,
             ("fastq", "lims"),
+            specs,
             LZ_BUCKET,
             "orcaglue/x/dev",
             dry_run=False,
@@ -494,12 +654,25 @@ def test_load_marts_attempts_every_table_then_fails():
     assert connections[0].statements == []
 
 
+def test_process_table_fails_a_table_the_ddl_file_lacks():
+    s3 = FakeS3()
+    s3.add_table("fastq", sizes=(10,))
+
+    result = job.process_table(s3, None, BUCKET, PREFIX, "fastq", SPECS, dry_run=True)
+
+    assert result.status == "failed"
+    assert "The DDL file has no fastq table" in result.error
+    assert s3.copies == []
+
+
 def test_process_table_fails_the_table_when_the_login_fails():
     s3 = FakeS3()
     s3.add_table("lims", sizes=(10,))
     connect_db, _ = failing_connect(job.InterfaceError("network error"))
 
-    result = job.process_table(s3, connect_db, BUCKET, PREFIX, "lims", dry_run=False)
+    result = job.process_table(
+        s3, connect_db, BUCKET, PREFIX, "lims", SPECS, dry_run=False
+    )
 
     assert (result.status, result.error) == ("failed", "InterfaceError: network error")
 
@@ -514,25 +687,48 @@ def test_pg_type_maps_the_redshift_mart_types():
         ddl.pg_type(ddl.Column("a", "super"))
 
 
-def test_ddl_for_keeps_the_redshift_column_order():
+def test_table_spec_keeps_the_redshift_column_order_and_the_indexes():
     columns = [
         ddl.Column("portal_run_id", "character", 16),
         ddl.Column("key", "character varying", 1024),
     ]
 
-    assert ddl.ddl_for("bam", columns) == (
-        "DROP TABLE IF EXISTS mart.bam;\n\n"
-        "CREATE TABLE mart.bam\n"
-        "(\n"
-        '    "portal_run_id" char(16),\n'
-        '    "key"           varchar(1024)\n'
-        ");"
+    assert ddl.table_spec("bam", columns, [("portal_run_id",)]) == job.TableSpec(
+        "bam",
+        (("portal_run_id", "char(16)"), ("key", "varchar(1024)")),
+        (("portal_run_id",),),
     )
 
 
-def test_init_sql_file_creates_exactly_the_default_tables():
-    init_sql = Path(__file__).with_name("init.sql").read_text(encoding="utf-8")
+def test_render_ddl_round_trips_with_a_column_per_line(tmp_path):
+    specs = {"lims": LIMS, "bam": job.TableSpec("bam", (("key", "varchar(1024)"),))}
+    path = tmp_path / "mart_tables.json"
 
-    created = re.findall(r"^CREATE TABLE mart\.(\w+)$", init_sql, flags=re.MULTILINE)
-    assert tuple(created) == job.MART_TABLES_DEFAULT
-    assert "TO dbuser_rw;" in init_sql
+    text = ddl.render_ddl(specs, source="test")
+    path.write_text(text, encoding="utf-8")
+
+    assert job.parse_ddl(text) == specs
+    assert '        ["library_id", "varchar(255)"],' in text.splitlines()
+    assert ddl.read_indexes(str(path)) == {"lims": (("sequencing_run_id",),), "bam": ()}
+    assert ddl.read_indexes(str(tmp_path / "missing.json")) == {}
+
+
+def test_ddl_file_defines_exactly_the_default_tables():
+    specs = job.parse_ddl(DDL_FILE.read_text(encoding="utf-8"))
+
+    assert tuple(specs) == job.MART_TABLES_DEFAULT
+    assert specs["lims"].indexes == (("sequencing_run_id",),)
+
+
+@pytest.mark.parametrize("stack", ["dev", "prod"])
+def test_stack_mart_tables_are_in_the_ddl_file(stack):
+    config = (Path(__file__).parents[1] / f"Pulumi.{stack}.yaml").read_text(
+        encoding="utf-8"
+    )
+    value = re.search(
+        r"^\s*spreadsheet-mart-tables:mart-tables: (\S+)$", config, re.MULTILINE
+    )
+
+    tables = job.parse_tables(value.group(1))
+
+    assert set(tables) <= set(job.parse_ddl(DDL_FILE.read_text(encoding="utf-8")))
