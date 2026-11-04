@@ -39,8 +39,12 @@ def client_error(code: str, operation: str = "Operation") -> ClientError:
     return ClientError({"Error": {"Code": code, "Message": code}}, operation)
 
 
-def database_error(code: str) -> job.DatabaseError:
-    return job.DatabaseError({"S": "FATAL", "C": code, "M": code})
+def database_error(code: str, message: str | None = None) -> job.DatabaseError:
+    return job.DatabaseError({"S": "FATAL", "C": code, "M": message or code})
+
+
+# What aws_s3 raises just after Aurora resumes, before it has the s3Import role's credentials
+CREDENTIALS_PENDING = (job.INTERNAL_ERROR_SQLSTATE, job.CREDENTIALS_PENDING_MESSAGE)
 
 
 def manifest_body(*entries: tuple[str, int]) -> bytes:
@@ -119,7 +123,8 @@ class FakeConnection:
     """Answers the job's SQL like a pg8000 native connection, and records it.
 
     counts are the row counts of the shadow table, then of the live table. errors maps
-    the start of a statement to the SQLSTATEs it raises, one per run of it, in turn.
+    the start of a statement to the errors it raises, one per run of it, in turn: each a
+    SQLSTATE, or a (SQLSTATE, message) pair.
     """
 
     def __init__(self, counts=(3, 5), imported=(2, 1), live=True, errors=None):
@@ -136,7 +141,8 @@ class FakeConnection:
         self.columns = None
         for start, codes in self.errors.items():
             if sql.startswith(start) and codes:
-                raise database_error(codes.pop(0))
+                code = codes.pop(0)
+                raise database_error(*code if isinstance(code, tuple) else (code,))
         if sql.startswith("SELECT count(*)"):
             return self.answer("row_count", [[self.counts.pop(0)]])
         if sql == job.EXISTS_SQL:
@@ -407,8 +413,12 @@ def test_load_table_swaps_in_a_shadow_table_in_one_transaction():
         "SET LOCAL lock_timeout = '5s'",
         "DROP TABLE IF EXISTS mart_stg.lims",
         job.create_table_sql(LIMS),
+        "SAVEPOINT import",
         job.IMPORT_SQL,
+        "RELEASE SAVEPOINT import",
+        "SAVEPOINT import",
         job.IMPORT_SQL,
+        "RELEASE SAVEPOINT import",
         "SELECT count(*) AS row_count FROM mart_stg.lims",
         job.EXISTS_SQL,
         "SELECT count(*) AS row_count FROM mart.lims",
@@ -420,10 +430,10 @@ def test_load_table_swaps_in_a_shadow_table_in_one_transaction():
         "ALTER TABLE mart_stg.lims SET SCHEMA mart",
         "COMMIT",
     ]
-    assert db.connection.statements[4][1] == job.import_parameters(
+    assert db.connection.statements[5][1] == job.import_parameters(
         "lims", LIMS_COLUMNS, parts(10, 20)[0]
     )
-    assert db.connection.statements[7][1] == {"table_name": "mart.lims"}
+    assert db.connection.statements[11][1] == {"table_name": "mart.lims"}
     assert (result.rows_before, result.rows_after) == (5, 3)
 
 
@@ -530,11 +540,58 @@ def test_load_table_rolls_back_when_counts_differ():
 
 
 def test_load_table_rolls_back_when_an_import_fails():
+    # Another internal error, such as a corrupt part, isn't retried.
     db = job.Database(FakeConnection(errors={job.IMPORT_SQL: ["XX000"]}))
+    sleeps = []
 
     with pytest.raises(job.DatabaseError):
-        job.load_table(db, LIMS, parts(10), job.TableResult("lims"))
+        job.load_table(
+            db, LIMS, parts(10), job.TableResult("lims"), sleep=sleeps.append
+        )
 
+    assert sleeps == []
+    assert db.connection.sql()[-1] == "ROLLBACK"
+    assert "COMMIT" not in db.connection.sql()
+
+
+def test_load_table_retries_an_import_until_aurora_has_the_role_credentials(capsys):
+    db = job.Database(
+        FakeConnection(errors={job.IMPORT_SQL: [CREDENTIALS_PENDING] * 2})
+    )
+    sleeps = []
+    result = job.TableResult("lims")
+
+    job.load_table(db, LIMS, parts(10, 20), result, sleep=sleeps.append)
+
+    statements = db.connection.sql()
+    first = statements.index("SAVEPOINT import")
+    assert statements[first : first + 7] == [
+        "SAVEPOINT import",
+        job.IMPORT_SQL,
+        "ROLLBACK TO SAVEPOINT import",
+        job.IMPORT_SQL,
+        "ROLLBACK TO SAVEPOINT import",
+        job.IMPORT_SQL,
+        "RELEASE SAVEPOINT import",
+    ]
+    assert sleeps == [job.IMPORT_RETRY_SECONDS] * 2
+    assert statements[-1] == "COMMIT"
+    assert result.rows_after == 3
+    assert "s3Import role's credentials yet" in capsys.readouterr().out
+
+
+def test_load_table_gives_up_an_import_and_rolls_back():
+    pending = [CREDENTIALS_PENDING] * job.IMPORT_ATTEMPTS
+    db = job.Database(FakeConnection(errors={job.IMPORT_SQL: pending}))
+    sleeps = []
+
+    with pytest.raises(job.DatabaseError) as raised:
+        job.load_table(
+            db, LIMS, parts(10), job.TableResult("lims"), sleep=sleeps.append
+        )
+
+    assert job.credentials_pending(raised.value)
+    assert len(sleeps) == job.IMPORT_ATTEMPTS - 1
     assert db.connection.sql()[-1] == "ROLLBACK"
     assert "COMMIT" not in db.connection.sql()
 

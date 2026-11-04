@@ -130,6 +130,15 @@ WAKE_INTERVAL_SECONDS = 10
 STARTING_UP_SQLSTATE = "57P03"
 # SQLSTATE lock_not_available: lock_timeout ran out.
 LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
+# aws_s3 raises SQLSTATE internal_error with this message until Aurora has the s3Import
+# role's credentials, about 2 minutes after it resumes from 0 ACU (107 s on dev). The
+# import is retried for up to 5 minutes.
+INTERNAL_ERROR_SQLSTATE = "XX000"
+CREDENTIALS_PENDING_MESSAGE = (
+    "unable to access credentials stored with the database instance"
+)
+IMPORT_ATTEMPTS = 30
+IMPORT_RETRY_SECONDS = 10
 
 IMPORT_SQL = (
     "SELECT aws_s3.table_import_from_s3("
@@ -588,6 +597,49 @@ def parse_imported_rows(result: str) -> int:
     return int(match.group(1))
 
 
+def credentials_pending(error: Exception) -> bool:
+    """Whether aws_s3 failed because Aurora doesn't have the s3Import role's credentials yet."""
+    fields = server_error_fields(error)
+    return fields.get("C") == INTERNAL_ERROR_SQLSTATE and (
+        CREDENTIALS_PENDING_MESSAGE in fields.get("M", "")
+    )
+
+
+def import_part(
+    db: Database,
+    table: str,
+    columns: list[str],
+    part: Part,
+    null_marker: str = "",
+    attempts: int = IMPORT_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Import a part into the shadow table, returning the rows imported.
+
+    Just after Aurora resumes, aws_s3 can't yet get the s3Import role's credentials. That
+    error rolls back to a savepoint taken before the import, which keeps the parts already
+    imported, and retries.
+    """
+    db.execute("SAVEPOINT import")
+    for attempt in range(1, attempts + 1):
+        try:
+            rows = db.execute(
+                IMPORT_SQL, import_parameters(table, columns, part, null_marker)
+            )
+            db.execute("RELEASE SAVEPOINT import")
+            return parse_imported_rows(rows[0]["result"] if rows else "")
+        except DatabaseError as error:
+            if not credentials_pending(error) or attempt == attempts:
+                raise
+            db.execute("ROLLBACK TO SAVEPOINT import")
+            print(
+                "Aurora doesn't have the s3Import role's credentials yet; retrying the "
+                f"import in {IMPORT_RETRY_SECONDS}s ({attempt} of {attempts})"
+            )
+            sleep(IMPORT_RETRY_SECONDS)
+    raise ValueError(f"attempts must be at least 1, not {attempts}")
+
+
 def count_rows(db: Database, name: str) -> int:
     rows = db.execute(f"SELECT count(*) AS row_count FROM {name}")
     return int(rows[0]["row_count"])
@@ -657,11 +709,9 @@ def load_table(
         imported = 0
         for part in parts:
             started = monotonic()
-            rows = db.execute(
-                IMPORT_SQL,
-                import_parameters(table, spec.column_names, part, options.null_marker),
+            part_rows = import_part(
+                db, table, spec.column_names, part, options.null_marker, sleep=sleep
             )
-            part_rows = parse_imported_rows(rows[0]["result"] if rows else "")
             imported += part_rows
             print(
                 f"Imported {part_rows} rows from s3://{part.bucket}/{part.key} "

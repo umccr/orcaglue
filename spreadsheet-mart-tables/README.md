@@ -95,7 +95,12 @@ Then, for each table, in its own session and one transaction:
    [job/mart_tables.json](job/mart_tables.json). See [Mart DDL](#mart-ddl).
 3. Import each part into it with `(format csv, header match)`. `HEADER MATCH` fails the import
    if the CSV header doesn't match the table's columns by name and order, which catches a mart
-   that changed without `job/mart_tables.json` being regenerated.
+   that changed without `job/mart_tables.json` being regenerated. For about 2 minutes after
+   Aurora resumes from 0 ACU, it doesn't have the `s3Import` role's credentials, and an import
+   fails with `XX000 unable to access credentials stored with the database instance`. A
+   scheduled run usually finds Aurora paused, so its first import waits this out. The job rolls
+   that import back to a savepoint, which keeps the parts already imported, and retries it
+   every 10 s for up to 5 minutes. Later imports in the run don't wait.
 4. Check that the shadow table's row count equals the sum of the rows reported by the imports.
 5. Refuse to replace a non-empty `mart` table with 0 rows, unless the job runs with
    `--allow_empty true`.
@@ -239,7 +244,10 @@ Aurora directly:
   The Aurora security group already allows the whole VPC, so it needs no change.
 - **Python packages.** Glue 5.0 has no PostgreSQL driver. [job/requirements.txt](job/requirements.txt)
   pins the pure Python driver pg8000 and its dependencies, with hashes. Glue installs the
-  uploaded wheels with `--no-index`, so a run never reaches PyPI.
+  uploaded wheels with `--no-index`, so a run never reaches PyPI. It installs them into a new
+  venv that can't see the runtime's own packages, so the file lists every dependency, including
+  `python-dateutil` and `six`, at the Glue 5.0 runtime's versions. `make wheels` installs them
+  the same way, so a missing dependency fails there rather than in Glue.
 
 ## Aurora Setup
 

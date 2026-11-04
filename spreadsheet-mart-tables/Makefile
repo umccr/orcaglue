@@ -32,11 +32,16 @@ test:
 	$(PYTHON) -m pytest -q job/test_*.py
 
 # Download the job's wheels for `pulumi up` to upload. Runs on the host, before each deploy.
-# pip checks every file against its hash in job/requirements.txt.
+# pip checks every file against its hash in job/requirements.txt. Then install them as Glue
+# does, with --no-index into a new venv, which fails if job/requirements.txt misses a dependency.
 wheels:
-	rm -rf build/wheels
+	rm -rf build/wheels build/venv
 	$(PYTHON) -m pip download --require-hashes --no-deps --only-binary=:all: \
 		--dest build/wheels -r job/requirements.txt
+	$(PYTHON) -m venv build/venv
+	build/venv/bin/pip install --quiet --disable-pip-version-check --no-index build/wheels/*.whl
+	build/venv/bin/python -c "import pg8000.native; print('The wheels install with --no-index')"
+	rm -rf build/venv
 
 # Refresh the RDS CA bundle after AWS adds a CA. Review the diff before committing it.
 ca-bundle:

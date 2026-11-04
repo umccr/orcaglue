@@ -26,3 +26,5 @@ config:
   spreadsheet-mart-tables:trigger-enabled: "false"
   # 18:00 UTC = 04:00 AEST / 05:00 AEDT. A placeholder, to be set after the UNLOAD schedule.
   spreadsheet-mart-tables:schedule: cron(0 18 * * ? *)
+secretsprovider: awskms://alias/pulumi-state-key # pragma: allowlist secret
+encryptedkey: AQICAHjiIoInMawFdg3zsGPUuqK2Y2wKhSCcloZUamCbvHLzOQHxFqvhxPACgR7TfQKOgJNZAAAAfjB8BgkqhkiG9w0BBwagbzBtAgEAMGgGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMe6/9JqE7iDBoZQ8PAgEQgDs8h5LeKTN//6H3CrV4nVAiemuJ967OjVzqZI/3y5xIW2O1QV34kN+viZJN3QiB0qYcid/3/4xtBQR9Wg== # pragma: allowlist secret
