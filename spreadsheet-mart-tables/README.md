@@ -215,14 +215,14 @@ Module-specific config, in [Pulumi.dev.yaml](Pulumi.dev.yaml):
 | `aurora-database` | `orcanexus` | The Aurora database |
 | `aurora-user` | `dbuser_rw` | The database user, created with `rds_iam` by `04_rw.sql` |
 | `glue-subnet` | `UomPrimaryPrivateSubnetA` | The `Name` tag of the private subnet for the Glue connection, in the Aurora writer's AZ |
-| `mart-tables` | Not set | Optional. The tables to load, each in `job/mart_tables.json`. Without it, the job loads every table in that file. Prod lists 7 of them; see [Mart DDL](#mart-ddl) |
+| `mart-tables` | Not set | Optional. The tables to load, each in `job/mart_tables.json`. Without it, the job loads every table in that file. Neither stack sets it; see [Mart DDL](#mart-ddl) |
 | `mart-readers` | `dbuser_ro` | The roles granted `SELECT` on each new table |
 | `trigger-enabled` | `"false"` | The schedule stays off until the UNLOAD is scheduled and a manual run is validated |
 | `schedule` | `cron(0 18 * * ? *)` | 04:00 AEST / 05:00 AEDT. Set it to run after the UNLOAD |
 
 Deploy the `prod` stack only once Aurora `orcanexus-prod` exists and `04_rw.sql` has run on it.
 Before its first deploy, check that `glue-subnet` is in the Aurora writer's AZ. Before its first
-run, check that the prod UNLOAD has written a manifest for each table in its `mart-tables`.
+run, check that the prod UNLOAD has written a manifest for each table it loads.
 
 ### Network and Login
 
@@ -297,13 +297,11 @@ so a change reaches Aurora at the first run after `pulumi up`, with no DBA step.
   OrcaNexus API's filters and sort orders. `lims` has one on `sequencing_run_id`, the column
   the API pages it by.
 
-The file is generated from Redshift dev, whose `mart` has 10 tables. The prod stack's
-`mart-tables` lists 7 of them. On 2026-10-27, the prod Redshift `mart` had those 7, with the
-same columns as dev's, but not the 3 `em_library_*` marts, which OrcaVault added on 2026-10-23.
-Check prod again before its first deploy. If it has all 10, remove `mart-tables` from
-`Pulumi.prod.yaml`, and the job loads every table in the file. The job creates only the tables
-it loads. If prod's columns ever differ from dev's, `HEADER MATCH` fails that table, and it
-keeps its rows.
+The file is generated from Redshift dev, whose `mart` has 10 tables. Neither stack sets
+`mart-tables`, so both load every table in the file. On 2026-11-05, the prod Redshift `mart`
+had the same 10 tables as dev's, with the same columns. To hold a table back from a stage, list
+the others in that stack's `mart-tables`. The job creates only the tables it loads. If prod's
+columns ever differ from dev's, `HEADER MATCH` fails that table, and it keeps its rows.
 
 ## Glue Job Run
 
