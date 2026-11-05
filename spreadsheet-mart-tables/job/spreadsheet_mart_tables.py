@@ -27,7 +27,7 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeVar
 
 try:
     import boto3
@@ -78,34 +78,23 @@ except ModuleNotFoundError:  # pragma: no cover - lets unit tests import helpers
     SparkSession = None
 
 
-BASE_NAME_DEFAULT = "spreadsheet__mart_tables"
-S3_MID_PATH_DEFAULT = f"orcaglue/{BASE_NAME_DEFAULT}/dev"
 SCHEMA_NAME = "mart"
 # The shadow tables are loaded here, where the API users can't see them, then moved into mart.
 STAGE_SCHEMA_NAME = "mart_stg"
-# The swap drops the old table with its grants, so each new table is granted SELECT to these.
-MART_READERS_DEFAULT = ("dbuser_ro",)
-DB_NAME_DEFAULT = "orcanexus"
-DB_USER_DEFAULT = "dbuser_rw"
-DB_PORT_DEFAULT = 5432
 REGION_NAME = "ap-southeast-2"
 APPLICATION_NAME = "orcaglue-spreadsheet-mart-tables"
 SUMMARY_FILE_NAME = "orcanexus_mart_tables.manifest.json"
 MANIFEST_SUFFIX = "_manifest"
 
-# The mart tables unloaded from Redshift. Keep in sync with job/mart_tables.json and
-# the mart-tables stack config.
-MART_TABLES_DEFAULT = (
-    "bam",
-    "em_library_aliases",
-    "em_library_dns",
-    "em_library_services",
-    "fastq",
-    "lims",
-    "vcf",
-    "workflow",
-    "workflow_cost_report",
-    "workflow_output",
+# A live run logs in to Aurora and grants SELECT on each new table, so it needs these.
+# Pulumi passes them all from the stack config, which is the one place they are set.
+LIVE_RUN_OPTIONS = (
+    "aurora_host",
+    "aurora_port",
+    "aurora_user",
+    "aurora_database",
+    "aurora_ca_bundle",
+    "mart_readers",
 )
 
 # Table, column, index and role names are lowercase identifiers of at most 63 bytes,
@@ -139,6 +128,8 @@ CREDENTIALS_PENDING_MESSAGE = (
 )
 IMPORT_ATTEMPTS = 30
 IMPORT_RETRY_SECONDS = 10
+
+T = TypeVar("T")
 
 IMPORT_SQL = (
     "SELECT aws_s3.table_import_from_s3("
@@ -200,7 +191,9 @@ class TableSpec:
 
 @dataclass(frozen=True)
 class LoadOptions:
-    readers: tuple[str, ...] = MART_READERS_DEFAULT
+    # The swap drops the old table with its grants, so each new table is granted SELECT
+    # to these. A live run of the Glue job requires --mart_readers.
+    readers: tuple[str, ...] = ()
     null_marker: str = ""
     allow_empty: bool = False
 
@@ -269,12 +262,13 @@ def parse_names(
     return tuple(dict.fromkeys(validate_identifier(name) for name in names))
 
 
-def parse_tables(value: str | None) -> tuple[str, ...]:
-    return parse_names(value, MART_TABLES_DEFAULT, "--mart_tables")
+def parse_tables(value: str | None, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """The tables named, or else the default: the tables in the DDL file."""
+    return parse_names(value, default, "--mart_tables")
 
 
 def parse_readers(value: str | None) -> tuple[str, ...]:
-    return parse_names(value, MART_READERS_DEFAULT, "--mart_readers")
+    return parse_names(value, (), "--mart_readers")
 
 
 def qualified_name(table: str) -> str:
@@ -454,6 +448,21 @@ def tls_context(ca_bundle: str) -> ssl.SSLContext:
     return ssl.create_default_context(cadata=ca_bundle)
 
 
+def aurora_login(args: dict[str, str]) -> AuroraLogin:
+    """The Aurora login from the job's options. Only a dry run goes without them."""
+    missing = [f"--{name}" for name in LIVE_RUN_OPTIONS if not args.get(name)]
+    if missing:
+        raise ValueError(
+            f"Missing {', '.join(missing)}, which a run needs unless --dry_run is true"
+        )
+    return AuroraLogin(
+        host=args["aurora_host"],
+        port=int(args["aurora_port"]),
+        user=args["aurora_user"],
+        database=args["aurora_database"],
+    )
+
+
 def iam_auth_token(login: AuroraLogin) -> str:
     """A 15 minute IAM auth token, used as the password. It is signed locally."""
     return get_boto3_client("rds").generate_db_auth_token(
@@ -605,6 +614,42 @@ def credentials_pending(error: Exception) -> bool:
     )
 
 
+def retry_at_savepoint(
+    db: Database,
+    savepoint: str,
+    action: Callable[[], T],
+    retryable: Callable[[Exception], bool],
+    attempts: int,
+    retry_seconds: float,
+    reason: str,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[T, int]:
+    """Run the action at a savepoint, returning its result and the attempt that did it.
+
+    A retryable database error rolls back to the savepoint, which keeps the work done
+    earlier in the transaction, and the action runs again after retry_seconds. Any
+    other error, or the error of the last attempt, is raised.
+    """
+    db.execute(f"SAVEPOINT {validate_identifier(savepoint)}")
+    attempt = 1
+    while True:
+        try:
+            value = action()
+        except DatabaseError as error:
+            if attempt >= attempts or not retryable(error):
+                raise
+            db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            print(
+                f"{reason}; retrying the {savepoint} in {retry_seconds}s "
+                f"({attempt} of {attempts})"
+            )
+            sleep(retry_seconds)
+            attempt += 1
+        else:
+            db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return value, attempt
+
+
 def import_part(
     db: Database,
     table: str,
@@ -617,27 +662,21 @@ def import_part(
     """Import a part into the shadow table, returning the rows imported.
 
     Just after Aurora resumes, aws_s3 can't yet get the s3Import role's credentials. That
-    error rolls back to a savepoint taken before the import, which keeps the parts already
-    imported, and retries.
+    error is retried from a savepoint taken before the import, which keeps the parts
+    already imported.
     """
-    db.execute("SAVEPOINT import")
-    for attempt in range(1, attempts + 1):
-        try:
-            rows = db.execute(
-                IMPORT_SQL, import_parameters(table, columns, part, null_marker)
-            )
-            db.execute("RELEASE SAVEPOINT import")
-            return parse_imported_rows(rows[0]["result"] if rows else "")
-        except DatabaseError as error:
-            if not credentials_pending(error) or attempt == attempts:
-                raise
-            db.execute("ROLLBACK TO SAVEPOINT import")
-            print(
-                "Aurora doesn't have the s3Import role's credentials yet; retrying the "
-                f"import in {IMPORT_RETRY_SECONDS}s ({attempt} of {attempts})"
-            )
-            sleep(IMPORT_RETRY_SECONDS)
-    raise ValueError(f"attempts must be at least 1, not {attempts}")
+    parameters = import_parameters(table, columns, part, null_marker)
+    rows, _ = retry_at_savepoint(
+        db,
+        "import",
+        lambda: db.execute(IMPORT_SQL, parameters),
+        credentials_pending,
+        attempts,
+        IMPORT_RETRY_SECONDS,
+        "Aurora doesn't have the s3Import role's credentials yet",
+        sleep,
+    )
+    return parse_imported_rows(rows[0]["result"] if rows else "")
 
 
 def count_rows(db: Database, name: str) -> int:
@@ -663,22 +702,22 @@ def swap_in(
     rolls back to the savepoint and retries, without redoing the load.
     """
     live = qualified_name(table)
-    db.execute("SAVEPOINT swap")
-    for attempt in range(1, attempts + 1):
-        try:
-            db.execute(f"DROP TABLE IF EXISTS {live}")
-            db.execute(f"ALTER TABLE {staged_name(table)} SET SCHEMA {SCHEMA_NAME}")
-            return attempt
-        except DatabaseError as error:
-            if sqlstate(error) != LOCK_NOT_AVAILABLE_SQLSTATE or attempt == attempts:
-                raise
-            db.execute("ROLLBACK TO SAVEPOINT swap")
-            print(
-                f"Readers held {live} for {LOCK_TIMEOUT}; retrying the swap in "
-                f"{SWAP_RETRY_SECONDS}s ({attempt} of {attempts})"
-            )
-            sleep(SWAP_RETRY_SECONDS)
-    raise ValueError(f"attempts must be at least 1, not {attempts}")
+
+    def swap() -> None:
+        db.execute(f"DROP TABLE IF EXISTS {live}")
+        db.execute(f"ALTER TABLE {staged_name(table)} SET SCHEMA {SCHEMA_NAME}")
+
+    _, attempt = retry_at_savepoint(
+        db,
+        "swap",
+        swap,
+        lambda error: sqlstate(error) == LOCK_NOT_AVAILABLE_SQLSTATE,
+        attempts,
+        SWAP_RETRY_SECONDS,
+        f"Readers held {live} for {LOCK_TIMEOUT}",
+        sleep,
+    )
+    return attempt
 
 
 def load_table(
@@ -895,6 +934,7 @@ class GlueSpreadsheetMartTables(GlueJobBase):
 
         params = [
             "lz_bucket",
+            "s3_mid_path",
             "source_bucket",
             "source_prefix",
             "mart_ddl",
@@ -902,15 +942,8 @@ class GlueSpreadsheetMartTables(GlueJobBase):
 
         optional = [
             "JOB_NAME",
-            "base_name",
-            "s3_mid_path",
-            "aurora_host",
-            "aurora_port",
-            "aurora_user",
-            "aurora_database",
-            "aurora_ca_bundle",
+            *LIVE_RUN_OPTIONS,
             "mart_tables",
-            "mart_readers",
             "null_marker",
             "allow_empty",
             "dry_run",
@@ -920,32 +953,23 @@ class GlueSpreadsheetMartTables(GlueJobBase):
         args = getResolvedOptions(sys.argv, params)
 
         self.lz_bucket = args["lz_bucket"]
+        self.s3_mid_path = args["s3_mid_path"]
         self.source_bucket = args["source_bucket"]
         self.source_prefix = args["source_prefix"]
         self.mart_ddl = args["mart_ddl"]
-        self.tables = parse_tables(args.get("mart_tables"))
+        # Parsed in run(), once the DDL file is read. Without it, the job loads every
+        # table in the DDL file.
+        self.mart_tables = args.get("mart_tables")
         self.options = LoadOptions(
             readers=parse_readers(args.get("mart_readers")),
             null_marker=args.get("null_marker", ""),
             allow_empty=parse_bool(args.get("allow_empty")),
         )
         self.dry_run = parse_bool(args.get("dry_run"))
-        self.s3_mid_path = args.get("s3_mid_path", S3_MID_PATH_DEFAULT)
 
         # A dry run doesn't touch Aurora, so it runs without the Aurora options.
-        self.login = None
+        self.login = None if self.dry_run else aurora_login(args)
         self.ca_bundle = args.get("aurora_ca_bundle")
-        if not self.dry_run:
-            if "aurora_host" not in args or not self.ca_bundle:
-                raise ValueError(
-                    "--aurora_host and --aurora_ca_bundle are required unless --dry_run is true"
-                )
-            self.login = AuroraLogin(
-                host=args["aurora_host"],
-                port=int(args.get("aurora_port", DB_PORT_DEFAULT)),
-                user=args.get("aurora_user", DB_USER_DEFAULT),
-                database=args.get("aurora_database", DB_NAME_DEFAULT),
-            )
 
         job_name = args.get("JOB_NAME", "GlueSpreadsheetMartTables")
         self.init(job_name, args)
@@ -954,6 +978,7 @@ class GlueSpreadsheetMartTables(GlueJobBase):
         s3 = get_boto3_client("s3")
         # A dry run reads the DDL file too, so it catches a table the file lacks.
         specs = parse_ddl(read_text(s3, self.mart_ddl))
+        tables = parse_tables(self.mart_tables, default=tuple(specs))
         connect_db = None
         if self.login is None:
             print("Dry run enabled: skipping the Aurora load")
@@ -966,7 +991,7 @@ class GlueSpreadsheetMartTables(GlueJobBase):
             connect_db=connect_db,
             source_bucket=self.source_bucket,
             source_prefix=self.source_prefix,
-            tables=self.tables,
+            tables=tables,
             specs=specs,
             lz_bucket=self.lz_bucket,
             s3_mid_path=self.s3_mid_path,

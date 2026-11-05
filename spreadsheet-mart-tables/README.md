@@ -28,7 +28,8 @@ transformations belong upstream, in the OrcaVault dbt project.
 
 The job:
 
-- Reads the Redshift UNLOAD manifest of each table in `--mart_tables`.
+- Reads the Redshift UNLOAD manifest of each table it loads: the tables in `--mart_tables`, or
+  without it, every table in [job/mart_tables.json](job/mart_tables.json).
 - Sets `Content-Encoding: gzip` on each CSV part, by copying it onto itself. The Aurora
   `aws_s3` import only decompresses objects that carry that metadata, and Redshift UNLOAD
   doesn't set it.
@@ -90,7 +91,8 @@ refused login fails the job at once.
 
 Then, for each table, in its own session and one transaction:
 
-1. `SET LOCAL lock_timeout = '5s'`, which limits how long the swap waits for readers.
+1. `SET LOCAL lock_timeout`, which limits how long the swap waits for readers. See
+   [Blue-Green Swap](#blue-green-swap).
 2. Create the shadow table `mart_stg.<table>` from the table's columns in
    [job/mart_tables.json](job/mart_tables.json). See [Mart DDL](#mart-ddl).
 3. Import each part into it with `(format csv, header match)`. `HEADER MATCH` fails the import
@@ -117,7 +119,8 @@ The summary at `s3://<lz-bucket>/orcaglue/spreadsheet__mart_tables/<stage>/orcan
 records each table's status, parts, bytes, rows before and after, and the manifest's
 `LastModified`, which shows how old the unload was. A failed table's error gives the
 PostgreSQL SQLSTATE and message. The summary also lists the manifests under the prefix that
-aren't in `--mart_tables` (`unlisted_tables`): a new mart that needs adding.
+the job didn't load (`unlisted_tables`): a new mart that needs adding to `job/mart_tables.json`,
+or to the stack's `mart-tables`.
 
 ### Blue-Green Swap
 
@@ -140,9 +143,10 @@ Each table is refreshed without downtime for the OrcaNexus API:
 
 ### Known Limitations
 
-- **A swap can make queries wait for up to 5 seconds**, while it waits for a long-running query
-  on the table. A query or transaction held open past the retries, such as an idle transaction
-  in `psql`, fails that table's refresh with `55P03`.
+- **A swap can make queries wait**, for up to its lock timeout, while it waits for a
+  long-running query on the table. See [Blue-Green Swap](#blue-green-swap). A query or
+  transaction held open past the retries, such as an idle transaction in `psql`, fails that
+  table's refresh with `55P03`.
 - **No views or foreign keys on the mart tables.** The swap won't drop a table that other
   objects depend on, so that table fails with `2BP01`, and keeps its rows.
 - **The job sets the grants.** Each swap replaces the table, and the old table's grants go with
@@ -156,8 +160,6 @@ Each table is refreshed without downtime for the OrcaNexus API:
   parts smaller.
 - **Empty strings become NULL** while the unload writes NULL as an empty field. See the input
   contract.
-- **`em_library_*` marts.** `em_library_aliases`, `em_library_dns` and `em_library_services`
-  are in the Redshift dev `mart` schema but aren't models in the OrcaVault repository.
 
 ## Deployment
 
@@ -167,9 +169,9 @@ the Aurora cluster's VPC.
 
 The prerequisite, once per stage, is **the `dbuser_rw` login**, from the orcahouse DBA script
 `infra/aurora/dba/04_rw.sql`. It logs in with IAM database authentication (`rds_iam`), so it
-has no password or secret. The script also creates the `mart_stg` schema, and lets `dbuser_rw`
-create tables there and in `mart`. The job creates the `mart` tables at its first run. See
-[Aurora Setup](#aurora-setup).
+has no password or secret. The script also creates the `mart` and `mart_stg` schemas if they
+don't exist, and lets `dbuser_rw` create tables in both. The job creates the `mart` tables at
+its first run. See [Aurora Setup](#aurora-setup).
 
 Before each `pulumi preview` or `pulumi up`, download the job's wheels from the module root
 on the host. The stack uploads them, and fails if they are missing:
@@ -213,12 +215,14 @@ Module-specific config, in [Pulumi.dev.yaml](Pulumi.dev.yaml):
 | `aurora-database` | `orcanexus` | The Aurora database |
 | `aurora-user` | `dbuser_rw` | The database user, created with `rds_iam` by `04_rw.sql` |
 | `glue-subnet` | `UomPrimaryPrivateSubnetA` | The `Name` tag of the private subnet for the Glue connection, in the Aurora writer's AZ |
-| `mart-tables` | `bam,em_library_aliases,…,workflow_output` | The tables to load. Each must be in `job/mart_tables.json`. Prod lists only the 7 Centre marts |
+| `mart-tables` | Not set | Optional. The tables to load, each in `job/mart_tables.json`. Without it, the job loads every table in that file. Prod lists 7 of them; see [Mart DDL](#mart-ddl) |
 | `mart-readers` | `dbuser_ro` | The roles granted `SELECT` on each new table |
 | `trigger-enabled` | `"false"` | The schedule stays off until the UNLOAD is scheduled and a manual run is validated |
 | `schedule` | `cron(0 18 * * ? *)` | 04:00 AEST / 05:00 AEDT. Set it to run after the UNLOAD |
 
-The `prod` stack config is ready, but don't deploy it until Aurora `orcanexus-prod` exists.
+Deploy the `prod` stack only once Aurora `orcanexus-prod` exists and `04_rw.sql` has run on it.
+Before its first deploy, check that `glue-subnet` is in the Aurora writer's AZ. Before its first
+run, check that the prod UNLOAD has written a manifest for each table in its `mart-tables`.
 
 ### Network and Login
 
@@ -257,14 +261,16 @@ The job creates and replaces the `mart` tables itself, so the only DBA step is
 ### Ownership
 
 `dbuser_rw` creates the `mart` tables, so it owns them, which lets it drop and replace them.
-`04_rw.sql` gives it `USAGE` and `CREATE` on `mart` and `mart_stg`, and nothing more in the
-database. The master user `sadmin` can read the tables, because `rds_superuser` has
-`pg_read_all_data`, but it can't drop or alter them: it isn't a member of `dbuser_rw`. To
-change a table by hand, log in as `dbuser_rw` with an IAM auth token.
+Besides its login (`rds_iam` and `CONNECT`) and `EXECUTE` on both `aws_s3.table_import_from_s3`
+overloads (the one the job calls is a wrapper that calls the other), `04_rw.sql` gives it only
+`USAGE` and `CREATE` on `mart` and `mart_stg`. The master user `sadmin` can read the tables,
+because `rds_superuser` has `pg_read_all_data`, but it can't drop or alter them: it isn't a
+member of `dbuser_rw`. To change a table by hand, log in as `dbuser_rw` with an IAM auth token.
 
-A `mart` table that the job didn't create, such as one from the earlier `job/init.sql`, fails
-its refresh with `42501 must be owner of table`. Drop it as `sadmin`, and the next run creates
-it.
+A `mart` table that the job didn't create, such as one made by hand as `sadmin`, fails its
+refresh with `42501 must be owner of table`. A foreign table fails with `42809`. Drop it as
+`sadmin`, with `DROP FOREIGN TABLE` for a foreign table, then start the job, which creates it.
+The API has no table until the job's run commits it.
 
 ### Mart DDL
 
@@ -274,7 +280,8 @@ so a change reaches Aurora at the first run after `pulumi up`, with no DBA step.
 
 - **Columns** are generated from the Redshift mart columns, so don't edit them by hand.
   Regenerate them after a mart changes, from the module root on the host, then change the
-  OrcaNexus jOOQ model to match:
+  OrcaNexus jOOQ model to match. `make ddl` queries the Redshift dev workgroup. Dev and prod
+  share account `115253169271`, so the session is that account's admin profile:
 
   ```bash
   export AWS_PROFILE=unimelb-warehouse-prod-admin
@@ -282,15 +289,21 @@ so a change reaches Aurora at the first run after `pulumi up`, with no DBA step.
   git diff job/mart_tables.json
   ```
 
+- **Tables** are the ones already in the file, which `make ddl` regenerates. To add or drop a
+  table, name every table: `make ddl mart_tables=bam,fastq,…`.
+
 - **Indexes** are edited by hand, as lists of column names, and `make ddl` keeps them. The job
   names each `<table>_<columns>_idx`, and builds it after the load. Add indexes for the
   OrcaNexus API's filters and sort orders. `lims` has one on `sequencing_run_id`, the column
   the API pages it by.
 
-The file is generated from Redshift dev, whose `mart` has 10 tables. The prod Redshift `mart`
-has only the 7 Centre marts, with the same columns as dev's (checked 2026-10-27). The prod job
-creates only the tables in its `mart-tables`. If prod's columns ever differ from dev's,
-`HEADER MATCH` fails that table, and it keeps its rows.
+The file is generated from Redshift dev, whose `mart` has 10 tables. The prod stack's
+`mart-tables` lists 7 of them. On 2026-10-27, the prod Redshift `mart` had those 7, with the
+same columns as dev's, but not the 3 `em_library_*` marts, which OrcaVault added on 2026-10-23.
+Check prod again before its first deploy. If it has all 10, remove `mart-tables` from
+`Pulumi.prod.yaml`, and the job loads every table in the file. The job creates only the tables
+it loads. If prod's columns ever differ from dev's, `HEADER MATCH` fails that table, and it
+keeps its rows.
 
 ## Glue Job Run
 

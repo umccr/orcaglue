@@ -23,12 +23,13 @@ lz_bucket = config.require("lz-bucket")
 source_bucket = config.require("source-bucket")
 source_prefix = config.require("source-prefix")
 aurora_cluster_id = config.require("aurora-cluster")
-aurora_database = config.get("aurora-database") or "orcanexus"
-aurora_user = config.get("aurora-user") or "dbuser_rw"
+aurora_database = config.require("aurora-database")
+aurora_user = config.require("aurora-user")
 glue_subnet_name = config.require("glue-subnet")
-mart_tables = config.require("mart-tables")
+# Optional. Without it, the job loads every table in the DDL file.
+mart_tables = config.get("mart-tables")
 # Granted SELECT on each new mart table. The swap drops the old table with its grants.
-mart_readers = config.get("mart-readers") or "dbuser_ro"
+mart_readers = config.require("mart-readers")
 shared_infra_path = config.require("shared-infra")
 # Default is 18:00 UTC = 04:00 AEST / 05:00 AEDT. Set it after the Redshift UNLOAD.
 schedule = config.get("schedule") or "cron(0 18 * * ? *)"
@@ -222,52 +223,43 @@ def pinned_wheels(requirements_path: str) -> list[str]:
     return wheels
 
 
-# Upload the job's Python wheels. Glue installs them from S3 only, so a run never needs PyPI.
-wheels_s3 = [
-    aws.s3.BucketObject(
-        f"wheel-{os.path.basename(path)}",
+def upload(name: str, path: str, folder: str = "") -> aws.s3.BucketObject:
+    """Upload a file next to the job script, again whenever its content changes."""
+    return aws.s3.BucketObject(
+        name,
         bucket=landing_zone_bucket.bucket,
-        key=f"{s3_mid_path}/wheels/{os.path.basename(path)}",
+        key=f"{s3_mid_path}/{folder}{os.path.basename(path)}",
         source=pulumi.FileAsset(path),
         etag=file_md5(path),
     )
+
+
+# Upload the job's Python wheels. Glue installs them from S3 only, so a run never needs PyPI.
+wheels_s3 = [
+    upload(f"wheel-{os.path.basename(path)}", path, folder="wheels/")
     for path in pinned_wheels(requirements)
 ]
 
 pulumi.export("wheel_s3_keys", [wheel.key for wheel in wheels_s3])
 
 # Upload the RDS regional CA bundle, which the job verifies Aurora's certificate with
-rds_ca_bundle_s3 = aws.s3.BucketObject(
-    "rds-ca-bundle",
-    bucket=landing_zone_bucket.bucket,
-    key=f"{s3_mid_path}/{os.path.basename(rds_ca_bundle)}",
-    source=pulumi.FileAsset(rds_ca_bundle),
-    etag=file_md5(rds_ca_bundle),
-)
+rds_ca_bundle_s3 = upload("rds-ca-bundle", rds_ca_bundle)
 
 pulumi.export("rds_ca_bundle_s3_key", rds_ca_bundle_s3.key)
 
 # Upload the mart table DDL, which the job creates each shadow table from
-mart_ddl_s3 = aws.s3.BucketObject(
-    "mart-ddl",
-    bucket=landing_zone_bucket.bucket,
-    key=f"{s3_mid_path}/{os.path.basename(mart_ddl)}",
-    source=pulumi.FileAsset(mart_ddl),
-    etag=file_md5(mart_ddl),
-)
+mart_ddl_s3 = upload("mart-ddl", mart_ddl)
 
 pulumi.export("mart_ddl_s3_key", mart_ddl_s3.key)
 
 # Upload job script
-job_script_s3 = aws.s3.BucketObject(
-    "job-script",
-    bucket=landing_zone_bucket.bucket,
-    key=f"{s3_mid_path}/{os.path.basename(job_script)}",
-    source=pulumi.FileAsset(job_script),
-    etag=file_md5(job_script),
-)
+job_script_s3 = upload("job-script", job_script)
 
 pulumi.export("job_script_s3_key", job_script_s3.key)
+
+# The tables the job loads: mart-tables, or else every table in the DDL file.
+with open(mart_ddl, encoding="utf-8") as handle:
+    loaded_tables = mart_tables or ",".join(json.load(handle)["tables"])
 
 # --- Glue Job ---
 
@@ -301,7 +293,6 @@ glue_job = aws.glue.Job(
                 f"s3://{args[0]}/{key}" for key in args[3:]
             ),
             "--lz_bucket": args[0],
-            "--base_name": base_name,
             "--s3_mid_path": s3_mid_path,
             "--source_bucket": source_bucket,
             "--source_prefix": source_prefix,
@@ -311,7 +302,7 @@ glue_job = aws.glue.Job(
             "--aurora_database": aurora_database,
             "--aurora_ca_bundle": f"s3://{args[0]}/{args[1]}",
             "--mart_ddl": f"s3://{args[0]}/{args[2]}",
-            "--mart_tables": mart_tables,
+            **({"--mart_tables": mart_tables} if mart_tables else {}),
             "--mart_readers": mart_readers,
             "--allow_empty": "false",
             "--dry_run": "false",
@@ -332,7 +323,7 @@ glue_job = aws.glue.Job(
 pulumi.export("glue_job_name", glue_job.name)
 pulumi.export("source_uri", f"s3://{source_bucket}/{source_prefix}")
 pulumi.export("target_schema", f"{aurora_cluster_id}/{aurora_database}.mart")
-pulumi.export("mart_tables", mart_tables)
+pulumi.export("mart_tables", loaded_tables)
 
 # --- Glue Trigger ---
 

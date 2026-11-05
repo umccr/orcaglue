@@ -10,7 +10,9 @@ install:
 include ../local.mk
 
 PYTHON ?= python
-mart_tables ?= bam,em_library_aliases,em_library_dns,em_library_services,fastq,lims,vcf,workflow,workflow_cost_report,workflow_output
+# Unset, run-dry and ddl take every table in job/mart_tables.json. Override with, for
+# example, `make run-dry mart_tables=lims,fastq`.
+mart_tables ?=
 
 cwd:
 	cd /home/hadoop/workspace/spreadsheet-mart-tables
@@ -25,7 +27,7 @@ run-dry: debug cwd
 		--source_bucket "orcavault-dev-warehouse-115253169271-ap-southeast-2-an" \
 		--source_prefix "v1/csv/mart/" \
 		--mart_ddl job/mart_tables.json \
-		--mart_tables "$(mart_tables)" \
+		$(if $(mart_tables),--mart_tables "$(mart_tables)") \
 		--dry_run true
 
 test:
@@ -49,10 +51,11 @@ ca-bundle:
 		-o job/rds-ca-ap-southeast-2-bundle.pem
 
 # Regenerate the columns in job/mart_tables.json from the Redshift dev mart, keeping its
-# indexes. Runs on the host, with an AWS session that can read the Redshift admin secret.
+# tables and indexes. To add or drop a table, name every table in mart_tables. Runs on the
+# host, with an AWS session that can read the Redshift admin secret.
 ddl:
 	$(PYTHON) job/generate_mart_ddl.py \
 		--workgroup orcahouse-dev \
 		--secret-arn 'redshift!orcahouse-dev-admin' \
-		--tables "$(mart_tables)" \
+		$(if $(mart_tables),--tables "$(mart_tables)") \
 		--output job/mart_tables.json

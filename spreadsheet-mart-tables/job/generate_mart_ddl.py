@@ -11,8 +11,9 @@ Run from the module root with an AWS session that can query the workgroup:
     python job/generate_mart_ddl.py --workgroup orcahouse-dev \\
         --secret-arn 'redshift!orcahouse-dev-admin' --output job/mart_tables.json
 
-or `make ddl`. Without --secret-arn, the caller's IAM identity is used, which
-only sees the mart tables it has privileges on.
+or `make ddl`. It regenerates the tables already in the output file. To add or drop a
+table, name every table with --tables. Without --secret-arn, the caller's IAM identity
+is used, which only sees the mart tables it has privileges on.
 """
 
 from __future__ import annotations
@@ -26,7 +27,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from spreadsheet_mart_tables import (
-    MART_TABLES_DEFAULT,
     REGION_NAME,
     SCHEMA_NAME,
     TableSpec,
@@ -198,11 +198,18 @@ def main() -> int:
     parser.add_argument(
         "--secret-arn", help="Redshift secret name or ARN to connect as"
     )
-    parser.add_argument("--tables", default=",".join(MART_TABLES_DEFAULT))
+    parser.add_argument(
+        "--tables", help="The tables, comma separated. Default: those in --output"
+    )
     parser.add_argument("--output", help="Write to this file instead of stdout")
     args = parser.parse_args()
 
-    tables = parse_tables(args.tables)
+    indexes = read_indexes(args.output) if args.output else {}
+    tables = parse_tables(args.tables, default=tuple(indexes))
+    if not tables:
+        print("Name the tables with --tables", file=sys.stderr)
+        return 2
+
     client = get_boto3_client("redshift-data")
     columns = fetch_columns(client, args.workgroup, args.database, args.secret_arn)
 
@@ -212,7 +219,6 @@ def main() -> int:
         return 1
 
     # An index on a column that Redshift dropped fails here, to be fixed by hand.
-    indexes = read_indexes(args.output) if args.output else {}
     text = render_ddl(
         {
             table: table_spec(table, columns[table], indexes.get(table, ()))

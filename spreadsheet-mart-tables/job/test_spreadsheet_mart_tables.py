@@ -175,10 +175,12 @@ def ddl_text(**tables) -> str:
 
 
 def test_parse_names_default_and_validate():
-    assert job.parse_tables(None) == job.MART_TABLES_DEFAULT
-    assert job.parse_tables(" lims, fastq ,lims") == ("lims", "fastq")
-    assert job.parse_readers(None) == ("dbuser_ro",)
+    assert job.parse_tables(None, default=("bam", "lims")) == ("bam", "lims")
+    assert job.parse_tables(" lims, fastq ,lims", default=("bam",)) == ("lims", "fastq")
+    assert job.parse_readers(None) == ()
     assert job.parse_readers("dbuser_ro,api_ro") == ("dbuser_ro", "api_ro")
+    with pytest.raises(ValueError, match="names nothing"):
+        job.parse_readers(" , ")
     with pytest.raises(ValueError, match="identifier"):
         job.parse_tables("lims;drop table x")
     with pytest.raises(ValueError, match="identifier"):
@@ -405,8 +407,9 @@ def test_describe_error_gives_a_server_error_as_its_sqlstate_and_message():
 def test_load_table_swaps_in_a_shadow_table_in_one_transaction():
     db = job.Database(FakeConnection(counts=(3, 5), imported=(2, 1)))
     result = job.TableResult("lims")
+    options = job.LoadOptions(readers=("dbuser_ro",))
 
-    job.load_table(db, LIMS, parts(10, 20), result)
+    job.load_table(db, LIMS, parts(10, 20), result, options)
 
     assert db.connection.sql() == [
         "BEGIN",
@@ -428,6 +431,7 @@ def test_load_table_swaps_in_a_shadow_table_in_one_transaction():
         "SAVEPOINT swap",
         "DROP TABLE IF EXISTS mart.lims",
         "ALTER TABLE mart_stg.lims SET SCHEMA mart",
+        "RELEASE SAVEPOINT swap",
         "COMMIT",
     ]
     assert db.connection.statements[5][1] == job.import_parameters(
@@ -444,9 +448,10 @@ def test_load_table_creates_the_live_table_on_the_first_load(capsys):
     job.load_table(db, LIMS, parts(10, 20), result)
 
     assert "SELECT count(*) AS row_count FROM mart.lims" not in db.connection.sql()
-    assert db.connection.sql()[-3:] == [
+    assert db.connection.sql()[-4:] == [
         "DROP TABLE IF EXISTS mart.lims",
         "ALTER TABLE mart_stg.lims SET SCHEMA mart",
+        "RELEASE SAVEPOINT swap",
         "COMMIT",
     ]
     assert (result.rows_before, result.rows_after) == (None, 3)
@@ -477,7 +482,7 @@ def test_load_table_retries_the_swap_while_readers_hold_the_table():
 
     job.load_table(db, LIMS, parts(10, 20), result, sleep=sleeps.append)
 
-    assert db.connection.sql()[-8:] == [
+    assert db.connection.sql()[-9:] == [
         "SAVEPOINT swap",
         "DROP TABLE IF EXISTS mart.lims",
         "ROLLBACK TO SAVEPOINT swap",
@@ -485,6 +490,7 @@ def test_load_table_retries_the_swap_while_readers_hold_the_table():
         "ROLLBACK TO SAVEPOINT swap",
         "DROP TABLE IF EXISTS mart.lims",
         "ALTER TABLE mart_stg.lims SET SCHEMA mart",
+        "RELEASE SAVEPOINT swap",
         "COMMIT",
     ]
     assert sleeps == [job.SWAP_RETRY_SECONDS] * 2
@@ -770,10 +776,9 @@ def test_render_ddl_round_trips_with_a_column_per_line(tmp_path):
     assert ddl.read_indexes(str(tmp_path / "missing.json")) == {}
 
 
-def test_ddl_file_defines_exactly_the_default_tables():
+def test_ddl_file_parses_with_the_lims_index():
     specs = job.parse_ddl(DDL_FILE.read_text(encoding="utf-8"))
 
-    assert tuple(specs) == job.MART_TABLES_DEFAULT
     assert specs["lims"].indexes == (("sequencing_run_id",),)
 
 
@@ -785,7 +790,49 @@ def test_stack_mart_tables_are_in_the_ddl_file(stack):
     value = re.search(
         r"^\s*spreadsheet-mart-tables:mart-tables: (\S+)$", config, re.MULTILINE
     )
+    specs = job.parse_ddl(DDL_FILE.read_text(encoding="utf-8"))
 
-    tables = job.parse_tables(value.group(1))
+    # A stack without mart-tables loads every table in the DDL file.
+    tables = job.parse_tables(value and value.group(1), default=tuple(specs))
 
-    assert set(tables) <= set(job.parse_ddl(DDL_FILE.read_text(encoding="utf-8")))
+    assert set(tables) <= set(specs)
+
+
+def test_aurora_login_needs_every_live_run_option():
+    args = {
+        "aurora_host": LOGIN.host,
+        "aurora_port": "5432",
+        "aurora_user": "dbuser_rw",
+        "aurora_database": "orcanexus",
+        "aurora_ca_bundle": f"s3://{LZ_BUCKET}/orcaglue/x/dev/rds-ca.pem",
+        "mart_readers": "dbuser_ro",
+    }
+
+    assert job.aurora_login(args) == LOGIN
+    with pytest.raises(ValueError, match="Missing --aurora_user, --mart_readers,"):
+        job.aurora_login({**args, "aurora_user": "", "mart_readers": ""})
+
+
+def test_generate_ddl_regenerates_the_tables_in_the_file(tmp_path, monkeypatch):
+    output = tmp_path / "mart_tables.json"
+    output.write_text(ddl.render_ddl(SPECS, source="old"), encoding="utf-8")
+    redshift = {
+        "lims": [ddl.Column(name, "character varying", 255) for name in LIMS_COLUMNS],
+        "bam": [ddl.Column("key", "character varying", 1024)],
+    }
+    monkeypatch.setattr(ddl, "get_boto3_client", lambda service: None)
+    monkeypatch.setattr(ddl, "fetch_columns", lambda *args: redshift)
+
+    def generate(*argv: str) -> int:
+        monkeypatch.setattr("sys.argv", ["generate_mart_ddl.py", *argv])
+        return ddl.main()
+
+    assert generate("--output", str(output)) == 0
+    specs = job.parse_ddl(output.read_text(encoding="utf-8"))
+    assert list(specs) == ["lims"]
+    assert specs["lims"].indexes == LIMS.indexes
+
+    assert generate("--tables", "bam,lims", "--output", str(output)) == 0
+    assert list(job.parse_ddl(output.read_text(encoding="utf-8"))) == ["bam", "lims"]
+
+    assert generate("--output", str(tmp_path / "new.json")) == 2
