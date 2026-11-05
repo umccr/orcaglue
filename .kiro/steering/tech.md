@@ -39,6 +39,7 @@ Model new jobs on `spreadsheet-google-lims/job/spreadsheet_google_lims.py` and `
 - Provide `job/init.sql` for the target table. It is run **manually** in the Redshift Query Editor (old-school DBA style), not by the job.
 - The `transform()` step can regenerate the DDL: comment out the `load()` call and run the job to emit the inferred `CREATE TABLE`.
 - All columns are `varchar`. Use `varchar(65535)` for wide/free-text columns.
+- Exception: `spreadsheet-mart-tables` loads Aurora PostgreSQL, not Redshift, and has no `init.sql`. The job creates its tables from `job/mart_tables.json` (`make ddl`) and refreshes each with a blue-green swap: load a shadow table in `mart_stg`, then drop the `mart` table and `SET SCHEMA mart`, in one transaction. See its README.
 
 ## Infrastructure (Pulumi)
 

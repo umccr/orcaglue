@@ -1,0 +1,33 @@
+config:
+  aws:region: ap-southeast-2
+  # NOTE: deploy only after Aurora orcanexus-prod exists and orcahouse infra/aurora/dba/04_rw.sql
+  # has run on it. See Deployment in the README.
+  # Format: <current-project-name>:<key-name>: organization/<target-project>/<target-stack>
+  spreadsheet-mart-tables:shared-infra: organization/shared-infra/prod
+  # The job's own pinned wheels, not the shared requirements.txt. Run `make wheels` before `pulumi up`.
+  spreadsheet-mart-tables:requirements: job/requirements.txt
+  spreadsheet-mart-tables:job-script: job/spreadsheet_mart_tables.py
+  spreadsheet-mart-tables:rds-ca-bundle: job/rds-ca-ap-southeast-2-bundle.pem
+  # The mart table DDL, generated from Redshift by `make ddl`. The job creates each shadow table from it.
+  spreadsheet-mart-tables:mart-ddl: job/mart_tables.json
+  spreadsheet-mart-tables:lz-bucket: orcahouse-prod-landing-zone-115253169271-ap-southeast-2-an
+  # The Redshift UNLOAD target. See the Input Contract in the README.
+  spreadsheet-mart-tables:source-bucket: orcavault-prod-warehouse-115253169271-ap-southeast-2-an
+  spreadsheet-mart-tables:source-prefix: v1/csv/mart/
+  spreadsheet-mart-tables:aurora-cluster: orcanexus-prod
+  spreadsheet-mart-tables:aurora-database: orcanexus
+  # Created with rds_iam by orcahouse infra/aurora/dba/04_rw.sql.
+  spreadsheet-mart-tables:aurora-user: dbuser_rw
+  # The UomPrimaryVpc private subnet for the Glue network connection, in the Aurora writer's AZ.
+  # Check the writer's AZ before the first deploy.
+  spreadsheet-mart-tables:glue-subnet: UomPrimaryPrivateSubnetA
+  # 7 of the 10 tables in job/mart_tables.json. On 2026-10-27 the prod Redshift mart didn't have the
+  # em_library_* marts. Check it before the first deploy: if it has all 10, remove this key, and the
+  # job loads every table in the file. The job creates only the tables it loads. See Mart DDL in the README.
+  spreadsheet-mart-tables:mart-tables: bam,fastq,lims,vcf,workflow,workflow_cost_report,workflow_output
+  # Granted SELECT on each new mart table at every swap. Hand-made grants go with the old table.
+  spreadsheet-mart-tables:mart-readers: dbuser_ro
+  # Triggers are opt-in. Leave false until a manual run is validated.
+  spreadsheet-mart-tables:trigger-enabled: "false"
+  # 18:00 UTC = 04:00 AEST / 05:00 AEDT. A placeholder, to be set after the UNLOAD schedule.
+  spreadsheet-mart-tables:schedule: cron(0 18 * * ? *)

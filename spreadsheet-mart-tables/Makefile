@@ -1,0 +1,61 @@
+install:
+	@(cd .. && make install)
+
+# ---
+
+# targets inside Docker container
+
+.PHONY: install cwd run-dry test wheels ca-bundle ddl
+
+include ../local.mk
+
+PYTHON ?= python
+# Unset, run-dry and ddl take every table in job/mart_tables.json. Override with, for
+# example, `make run-dry mart_tables=lims,fastq`.
+mart_tables ?=
+
+cwd:
+	cd /home/hadoop/workspace/spreadsheet-mart-tables
+
+# Only a dry run works locally. The Aurora cluster is private, and only the Glue job reaches it,
+# through its VPC connection. Run the live load in Glue; see the README.
+run-dry: debug cwd
+	spark-submit \
+		job/spreadsheet_mart_tables.py \
+		--lz_bucket "orcahouse-dev-landing-zone-115253169271-ap-southeast-2-an" \
+		--s3_mid_path "orcaglue/spreadsheet__mart_tables/dev" \
+		--source_bucket "orcavault-dev-warehouse-115253169271-ap-southeast-2-an" \
+		--source_prefix "v1/csv/mart/" \
+		--mart_ddl job/mart_tables.json \
+		$(if $(mart_tables),--mart_tables "$(mart_tables)") \
+		--dry_run true
+
+test:
+	$(PYTHON) -m pytest -q job/test_*.py
+
+# Download the job's wheels for `pulumi up` to upload. Runs on the host, before each deploy.
+# pip checks every file against its hash in job/requirements.txt. Then install them as Glue
+# does, with --no-index into a new venv, which fails if job/requirements.txt misses a dependency.
+wheels:
+	rm -rf build/wheels build/venv
+	$(PYTHON) -m pip download --require-hashes --no-deps --only-binary=:all: \
+		--dest build/wheels -r job/requirements.txt
+	$(PYTHON) -m venv build/venv
+	build/venv/bin/pip install --quiet --disable-pip-version-check --no-index build/wheels/*.whl
+	build/venv/bin/python -c "import pg8000.native; print('The wheels install with --no-index')"
+	rm -rf build/venv
+
+# Refresh the RDS CA bundle after AWS adds a CA. Review the diff before committing it.
+ca-bundle:
+	curl -fsSL https://truststore.pki.rds.amazonaws.com/ap-southeast-2/ap-southeast-2-bundle.pem \
+		-o job/rds-ca-ap-southeast-2-bundle.pem
+
+# Regenerate the columns in job/mart_tables.json from the Redshift dev mart, keeping its
+# tables and indexes. To add or drop a table, name every table in mart_tables. Runs on the
+# host, with an AWS session that can read the Redshift admin secret.
+ddl:
+	$(PYTHON) job/generate_mart_ddl.py \
+		--workgroup orcahouse-dev \
+		--secret-arn 'redshift!orcahouse-dev-admin' \
+		$(if $(mart_tables),--tables "$(mart_tables)") \
+		--output job/mart_tables.json
