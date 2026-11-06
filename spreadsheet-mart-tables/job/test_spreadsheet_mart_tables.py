@@ -1,6 +1,5 @@
 import io
 import json
-import re
 import ssl
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +8,7 @@ from types import SimpleNamespace
 import generate_mart_ddl as ddl
 import pytest
 import spreadsheet_mart_tables as job
+import yaml
 from botocore.exceptions import ClientError
 
 BUCKET = "orcavault-dev-warehouse-115253169271-ap-southeast-2-an"
@@ -783,19 +783,16 @@ def test_ddl_file_parses_with_the_lims_index():
 
 
 @pytest.mark.parametrize("stack", ["dev", "prod"])
-def test_stack_mart_tables_are_in_the_ddl_file(stack):
-    config = (Path(__file__).parents[1] / f"Pulumi.{stack}.yaml").read_text(
-        encoding="utf-8"
-    )
-    value = re.search(
-        r"^\s*spreadsheet-mart-tables:mart-tables: (\S+)$", config, re.MULTILINE
-    )
+def test_each_stack_loads_every_table_in_the_ddl_file(stack):
+    path = Path(__file__).parents[1] / f"Pulumi.{stack}.yaml"
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))["config"]
     specs = job.parse_ddl(DDL_FILE.read_text(encoding="utf-8"))
+    value = config.get("spreadsheet-mart-tables:mart-tables")
 
-    # A stack without mart-tables loads every table in the DDL file.
-    tables = job.parse_tables(value and value.group(1), default=tuple(specs))
-
-    assert set(tables) <= set(specs)
+    # Neither stack sets mart-tables, so each loads every table in the DDL file. To hold a
+    # table back from a stage, set mart-tables in that stack and change this test with it.
+    assert value is None, f"Pulumi.{stack}.yaml sets mart-tables: {value}"
+    assert job.parse_tables(value, default=tuple(specs)) == tuple(specs)
 
 
 def test_aurora_login_needs_every_live_run_option():
