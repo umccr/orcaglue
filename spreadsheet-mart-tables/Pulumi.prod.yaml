@@ -19,15 +19,14 @@ config:
   # Created with rds_iam by orcahouse infra/aurora/dba/04_rw.sql.
   spreadsheet-mart-tables:aurora-user: dbuser_rw
   # The UomPrimaryVpc private subnet for the Glue network connection, in the Aurora writer's AZ.
-  # Check the writer's AZ before the first deploy.
-  spreadsheet-mart-tables:glue-subnet: UomPrimaryPrivateSubnetA
-  # 7 of the 10 tables in job/mart_tables.json. On 2026-10-27 the prod Redshift mart didn't have the
-  # em_library_* marts. Check it before the first deploy: if it has all 10, remove this key, and the
-  # job loads every table in the file. The job creates only the tables it loads. See Mart DDL in the README.
-  spreadsheet-mart-tables:mart-tables: bam,fastq,lims,vcf,workflow,workflow_cost_report,workflow_output
+  spreadsheet-mart-tables:glue-subnet: UomPrimaryPrivateSubnetC
+  # No mart-tables: prod loads every table in job/mart_tables.json, as dev does. On 2026-11-05 the
+  # prod Redshift mart had all 10, with the same columns as dev's. See Mart DDL in the README.
   # Granted SELECT on each new mart table at every swap. Hand-made grants go with the old table.
   spreadsheet-mart-tables:mart-readers: dbuser_ro
   # Triggers are opt-in. Leave false until a manual run is validated.
   spreadsheet-mart-tables:trigger-enabled: "false"
   # 18:00 UTC = 04:00 AEST / 05:00 AEDT. A placeholder, to be set after the UNLOAD schedule.
   spreadsheet-mart-tables:schedule: cron(0 18 * * ? *)
+secretsprovider: awskms://alias/pulumi-state-key # pragma: allowlist secret
+encryptedkey: AQICAHjiIoInMawFdg3zsGPUuqK2Y2wKhSCcloZUamCbvHLzOQENeqwurM3nTYaBuNiLYuCxAAAAfjB8BgkqhkiG9w0BBwagbzBtAgEAMGgGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMrZA0CD/apFJt4WDpAgEQgDv1EQXZo9zVxz8k8yW8EpHhOVNNI/9nkDJjBoUAD5m3KpgPllGccjanGC4UbBl5vSWEe05A9w+7aZ5ejA== # pragma: allowlist secret
