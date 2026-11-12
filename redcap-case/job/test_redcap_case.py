@@ -68,15 +68,16 @@ def test_extract_posts_expected_payload_and_writes_raw_bytes(out_path, monkeypat
 
 # --- transform ---
 
-def test_transform_ddl_skips_audit_columns_without_trailing_comma(out_path):
-    write_raw(out_path, "col_a,record_source,load_datetime\n1,a,b\n")
+def test_transform_ddl_lists_every_column_without_trailing_comma(out_path):
+    write_raw(out_path, "col_a,col_b,col_c\n1,a,b\n")
 
-    job.transform()
+    columns = job.transform()
 
     sql = Path(f"{out_path}.sql").read_text(encoding="utf-8")
-    assert "record_source" not in sql
-    assert "load_datetime" not in sql
-    assert 'varchar(65535),\n' not in sql
+    assert columns == ["col_a", "col_b", "col_c"]
+    for column in columns:
+        assert f'"{column}"' in sql
+    assert not any(line.rstrip().endswith(",") for line in sql.splitlines()[-2:])
 
 def test_transform_keeps_everything_as_text(out_path):
     write_raw(out_path, "col_a,col_b,col_c\n001,007,1.50\n")
@@ -184,12 +185,13 @@ def test_load_to_redshift_truncates_then_copies(monkeypatch):
         workgroup="orcahouse-dev",
         role="arn:aws:iam::123456789012:role/test",
         s3_csv_uri="s3://bucket/path/file.csv",
+        columns=["record_id", "col_b", "col_a"],
     )
 
     assert len(fake.statements) == 2
     truncate, copy = fake.statements
     assert truncate["Sql"].strip() == "TRUNCATE TABLE tsa.redcap__case;"
-    assert "COPY tsa.redcap__case" in copy["Sql"]
+    assert 'COPY tsa.redcap__case ("record_id", "col_b", "col_a")' in copy["Sql"]
     assert "FROM 's3://bucket/path/file.csv'" in copy["Sql"]
     assert "IGNOREHEADER 1" in copy["Sql"]
     for statement in fake.statements:
@@ -220,7 +222,7 @@ def test_load_does_not_copy_when_truncate_fails(monkeypatch):
     monkeypatch.setattr(job, "BASE_NAME", "redcap__case")
 
     with pytest.raises(RuntimeError):
-        job.load_to_redshift("wg", "role", "s3://bucket/file.csv")
+        job.load_to_redshift("wg", "role", "s3://bucket/file.csv", ["col_a"])
 
     assert len(fake.statements) == 1
 

@@ -73,7 +73,7 @@ def extract():
     with open(f"{OUT_PATH}__raw.csv", "wb") as f:
         f.write(response.content)
 
-def transform():
+def transform() -> list[str]:
     # treat all columns as string value, do not automatically infer the dataframe dtype
     # https://stackoverflow.com/questions/77318631/how-to-read-all-columns-as-strings-in-polars
     df = pl.read_csv(
@@ -116,11 +116,7 @@ def transform():
     df.write_csv(f"{OUT_PATH}.csv")
 
     # generate sql schema script
-    sql = ",\n".join(
-        f'"{col}"\tvarchar(65535)'
-        for col in df.columns
-        if col not in ("record_source", "load_datetime")
-    )
+    sql = ",\n".join(f'"{col}"\tvarchar(65535)' for col in df.columns)
 
     sql_schema = f"""CREATE TABLE IF NOT EXISTS {OUT_NAME_DOT}
     (
@@ -131,6 +127,8 @@ def transform():
         f.write(sql_schema)
 
     print(sql_schema)
+
+    return df.columns
 
 def _wait_for_query(client, statement_id: str):
     """Poll Redshift Data API until the statement reaches a terminal state."""
@@ -165,15 +163,19 @@ def upload_artifacts(bucket: str) -> str:
 
     return f"s3://{bucket}/{csv_s3_object_name}"
 
-def load_to_redshift(workgroup: str, role: str, s3_csv_uri: str):
+def load_to_redshift(workgroup: str, role: str, s3_csv_uri: str, columns: list[str]):
     """TRUNCATE the target table then COPY the staged CSV via the Redshift Data API."""
 
     table_name = f"{SCHEMA_NAME}.{BASE_NAME}"
 
+    # Explicit column list in CSV order, so the export order cannot shift values
+    # into the wrong (all varchar) target columns.
+    column_list = ", ".join('"{}"'.format(c.replace('"', '""')) for c in columns)
+
     truncate_sql = f"TRUNCATE TABLE {table_name};"
 
     copy_sql = f"""
-        COPY {table_name}
+        COPY {table_name} ({column_list})
         FROM '{s3_csv_uri}'
         IAM_ROLE '{role}'
         FORMAT AS CSV
@@ -184,7 +186,6 @@ def load_to_redshift(workgroup: str, role: str, s3_csv_uri: str):
     """
 
     redshift_data_client = boto3.client("redshift-data", region_name=REGION_NAME)
-
     common_kwargs = {
         "WorkgroupName": workgroup,
         "Database": DB_NAME,
@@ -206,7 +207,7 @@ def load_to_redshift(workgroup: str, role: str, s3_csv_uri: str):
 
     print(f"Load complete → {table_name}")
 
-def load(bucket: str, workgroup: str, role: str):
+def load(bucket: str, workgroup: str, role: str, columns: list[str]):
     """
     Load staged CSV data into Redshift Serverless via:
       1. Upload CSV and SQL artefacts to S3
@@ -215,7 +216,9 @@ def load(bucket: str, workgroup: str, role: str):
     """
 
     s3_csv_uri = upload_artifacts(bucket)
-    load_to_redshift(workgroup=workgroup, role=role, s3_csv_uri=s3_csv_uri)
+    load_to_redshift(
+        workgroup=workgroup, role=role, s3_csv_uri=s3_csv_uri, columns=columns
+    )
 
 def clean_up():
     # Remove the raw export: it may hold fields that are not in the transformed CSV.
@@ -267,14 +270,19 @@ class GlueRedcapCase(Job):
 
         extract()
 
-        transform()
+        columns = transform()
 
         # Use --dry_run true to upload the artefacts without touching Redshift.
         if self.dry_run:
             upload_artifacts(self.bucket)
             print("Dry run enabled: skipping Redshift load")
         else:
-            load(bucket=self.bucket, workgroup=self.workgroup, role=self.role)
+            load(
+                bucket=self.bucket,
+                workgroup=self.workgroup,
+                role=self.role,
+                columns=columns,
+            )
 
         clean_up()
 
