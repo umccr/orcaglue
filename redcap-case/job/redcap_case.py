@@ -135,14 +135,16 @@ def _wait_for_query(client, statement_id: str):
     while True:
         response = client.describe_statement(Id=statement_id)
         status = response["Status"]
+
         if status == "FINISHED":
             print(f"Statement {statement_id} finished successfully.")
-            break
-        elif status in ("FAILED", "ABORTED"):
+            return
+        if status in ("FAILED", "ABORTED"):
             raise RuntimeError(
                 f"Redshift Data API statement {statement_id} failed.\n"
                 f"Error: {response.get('Error')}"
             )
+
         print(f"Statement {statement_id} status: {status} — waiting...")
         time.sleep(2)
 
@@ -185,25 +187,22 @@ def load_to_redshift(workgroup: str, role: str, s3_csv_uri: str, columns: list[s
         REGION '{REGION_NAME}';
     """
 
-    redshift_data_client = boto3.client("redshift-data", region_name=REGION_NAME)
-    common_kwargs = {
-        "WorkgroupName": workgroup,
-        "Database": DB_NAME,
-    }
+    client = boto3.client("redshift-data", region_name=REGION_NAME)
+
+    def run(sql: str):
+        """Submit one statement and block until it finishes (raises on failure)."""
+        response = client.execute_statement(
+            WorkgroupName=workgroup,
+            Database=DB_NAME,
+            Sql=sql,
+        )
+        _wait_for_query(client, response["Id"])
 
     print(f"Truncating table: {table_name}")
-    truncate_response = redshift_data_client.execute_statement(
-        **common_kwargs,
-        Sql=truncate_sql,
-    )
-    _wait_for_query(redshift_data_client, truncate_response["Id"])
+    run(truncate_sql)
 
     print(f"Running COPY into: {table_name} from {s3_csv_uri}")
-    copy_response = redshift_data_client.execute_statement(
-        **common_kwargs,
-        Sql=copy_sql,
-    )
-    _wait_for_query(redshift_data_client, copy_response["Id"])
+    run(copy_sql)
 
     print(f"Load complete → {table_name}")
 
