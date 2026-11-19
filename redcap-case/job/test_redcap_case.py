@@ -1,4 +1,5 @@
 import csv
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -54,7 +55,8 @@ def test_extract_posts_expected_payload_and_writes_raw_bytes(out_path, monkeypat
     monkeypatch.setattr(job.libssm, "get_secret", lambda name: "secret-token")
     monkeypatch.setattr(job.requests, "post", fake_post)
 
-    job.extract()
+    # inside the first quarter of PAGINATE_FROM_YEAR: a single unbounded window
+    job.extract(today=date(2026, 2, 1))
 
     assert calls["url"] == job.REDCAP_ENDPOINT
     assert calls["timeout"] == job.REQUEST_TIMEOUT
@@ -62,9 +64,44 @@ def test_extract_posts_expected_payload_and_writes_raw_bytes(out_path, monkeypat
     assert calls["data"]["content"] == "record"
     assert calls["data"]["action"] == "export"
     assert calls["data"]["format"] == "csv"
+    assert "dateRangeBegin" not in calls["data"]
+    assert "dateRangeEnd" not in calls["data"]
     assert not any(key.startswith("fields[") for key in calls["data"])
     # raw bytes are kept untouched, including the newline inside the quoted cell
     assert Path(f"{out_path}__raw.csv").read_bytes() == body
+
+
+def test_build_intervals_overlap_and_open_ends():
+    assert job.build_intervals(date(2026, 2, 1)) == [(None, None)]
+    assert job.build_intervals(date(2026, 8, 18)) == [
+        (None, "2026-03-31 23:59:59"),
+        ("2026-03-31 00:00:00", "2026-06-30 23:59:59"),
+        ("2026-06-30 00:00:00", None),
+    ]
+
+
+def test_extract_paginates_with_one_header(out_path, monkeypatch):
+    windows = []
+    bodies = iter([b"id,v\n1,a\n", b"id,v\n1,a\n2,b\n", b"id,v\n"])
+
+    def fake_post(url, data, timeout):
+        windows.append((data.get("dateRangeBegin"), data.get("dateRangeEnd")))
+        return FakeResponse(200, next(bodies))
+
+    monkeypatch.setattr(job.libssm, "get_secret", lambda name: "t")
+    monkeypatch.setattr(job.requests, "post", fake_post)
+
+    job.extract(today=date(2026, 8, 18))
+
+    assert windows == job.build_intervals(date(2026, 8, 18))
+    assert Path(f"{out_path}__raw.csv").read_bytes() == b"id,v\n1,a\n1,a\n2,b\n"
+
+    # overlapping rows collapse in transform
+    job.transform()
+    assert read_rows(f"{out_path}.csv") == [
+        {"id": "1", "v": "a"},
+        {"id": "2", "v": "b"},
+    ]
 
 # --- transform ---
 

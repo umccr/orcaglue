@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from datetime import date
 
 import boto3
 import polars as pl
@@ -15,6 +16,8 @@ from pyspark.sql import SparkSession
 REDCAP_ENDPOINT = "https://redcap.unimelb.edu.au/api/"
 REDCAP_TOKEN_PARAMETER_NAME = "/orcabus/case-manager/redcap/redcap-api-token"
 REQUEST_TIMEOUT = 300  # seconds
+PAGINATE_FROM_YEAR = 2026
+QUARTER_ENDS = ((3, 31), (6, 30), (9, 30), (12, 31))  # (month, day)
 
 # NOTE: this is intended db table naming convention
 # i.e. <datasource>__<suffix_meaningful_naming_convention>
@@ -45,10 +48,46 @@ def parse_bool(value: str | bool | None, default: bool = False) -> bool:
         return False
     raise ValueError(f"Cannot parse boolean value: {value}")
 
-def extract():
-    """Export every record of the REDCap project as a flat CSV."""
-    token = libssm.get_secret(REDCAP_TOKEN_PARAMETER_NAME)
+def build_intervals(
+    today: date | None = None,
+) -> list[tuple[str | None, str | None]]:
+    """
+    Build the (dateRangeBegin, dateRangeEnd) windows used to paginate the export.
 
+    Windows follow calendar quarters (ends: 31 Mar, 30 Jun, 30 Sep, 31 Dec) from
+    PAGINATE_FROM_YEAR. The first window has no begin, so it also covers anything
+    older than that year. The last window has no end, so it reaches the latest records.
+    Each window starts on the previous quarter-end day, so adjacent windows overlap
+    by one day and no record is lost whether REDCap treats the bounds as inclusive or
+    exclusive. transform() drops the resulting exact duplicate rows.
+    """
+    today = today or date.today()
+
+    # Quarter ends that have already passed split the timeline into windows.
+    boundaries: list[date] = []
+    year = PAGINATE_FROM_YEAR
+    done = False
+    while not done:
+        for month, day in QUARTER_ENDS:
+            quarter_end = date(year, month, day)
+            if quarter_end >= today:
+                done = True
+                break
+            boundaries.append(quarter_end)
+        year += 1
+
+    intervals: list[tuple[str | None, str | None]] = []
+    begin: str | None = None
+    for boundary in boundaries:
+        intervals.append((begin, f"{boundary.isoformat()} 23:59:59"))
+        begin = f"{boundary.isoformat()} 00:00:00"
+    intervals.append((begin, None))
+
+    return intervals
+
+
+def _export_records(token: str, begin: str | None, end: str | None) -> bytes:
+    """Export one window of records as raw CSV bytes."""
     payload = {
         "token": token,
         "content": "record",
@@ -60,6 +99,10 @@ def extract():
         "exportCheckboxLabel": "false",
         "returnFormat": "json",
     }
+    if begin:
+        payload["dateRangeBegin"] = begin
+    if end:
+        payload["dateRangeEnd"] = end
 
     response = requests.post(REDCAP_ENDPOINT, data=payload, timeout=REQUEST_TIMEOUT)
 
@@ -69,9 +112,36 @@ def extract():
             f"REDCap API request failed with status {response.status_code}"
         )
 
+    return response.content
+
+
+def extract(today: date | None = None):
+    """Export every record of the REDCap project as a flat CSV, one quarter at a time."""
+    token = libssm.get_secret(REDCAP_TOKEN_PARAMETER_NAME)
+
+    header: bytes | None = None
+
     # Write the raw bytes so quotes and newlines inside free-text fields stay intact.
     with open(f"{OUT_PATH}__raw.csv", "wb") as f:
-        f.write(response.content)
+        for begin, end in build_intervals(today):
+            print(f"Exporting records from {begin or 'the beginning'} to {end or 'latest'}")
+            content = _export_records(token, begin, end)
+
+            if not content.strip():
+                continue
+
+            # The header holds plain variable names, so the first line break ends it.
+            head, _, body = content.partition(b"\n")
+            head = head.rstrip(b"\r")
+
+            if header is None:
+                header = head
+                f.write(head + b"\n")
+            elif head != header:
+                raise RuntimeError("REDCap export header changed between intervals")
+
+            if body.strip():
+                f.write(body if body.endswith(b"\n") else body + b"\n")
 
 def transform() -> list[str]:
     # treat all columns as string value, do not automatically infer the dataframe dtype
@@ -93,6 +163,11 @@ def transform() -> list[str]:
 
     # drop row iff all values are null
     df = df.filter(~pl.all_horizontal(pl.all().is_null()))
+
+    # Quarterly export windows overlap on the boundary day, so the same record can
+    # arrive twice. Drop exact whole-row duplicates only (never dedupe by record id:
+    # repeating instruments legitimately share one).
+    df = df.unique(keep="last", maintain_order=True)
 
     # drop all unnamed (blank) columns
     for col in df.columns:
