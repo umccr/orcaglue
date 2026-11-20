@@ -1,0 +1,368 @@
+import os
+import sys
+import time
+from datetime import date
+
+import boto3
+import polars as pl
+import requests
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from libumccr.aws import libs3, libssm
+from pyspark.sql import SparkSession
+
+# The datasource REDCap configuration
+REDCAP_ENDPOINT = "https://redcap.unimelb.edu.au/api/"
+REDCAP_TOKEN_PARAMETER_NAME = "/orcabus/case-manager/redcap/redcap-api-token"
+REQUEST_TIMEOUT = 300  # seconds
+PAGINATE_FROM_YEAR = 2026
+QUARTER_ENDS = ((3, 31), (6, 30), (9, 30), (12, 31))  # (month, day)
+
+# NOTE: this is intended db table naming convention
+# i.e. <datasource>__<suffix_meaningful_naming_convention>
+# e.g. <spreadsheet>__<some_research_data_collection>
+BASE_NAME_DEFAULT = "redcap__case"
+S3_MID_PATH_DEFAULT = f"orcaglue/{BASE_NAME_DEFAULT}/dev"
+SCHEMA_NAME = "tsa"
+DB_NAME = "orcavault"
+
+# Resolved at runtime in GlueRedcapCase constructor
+BASE_NAME = None
+S3_MID_PATH = None
+OUT_NAME = None
+OUT_NAME_DOT = None
+OUT_PATH = None
+
+REGION_NAME = "ap-southeast-2"
+def parse_bool(value: str | bool | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+
+    value = value.strip().lower()
+    if value in {"1", "true", "t", "yes", "y"}:
+        return True
+    if value in {"0", "false", "f", "no", "n"}:
+        return False
+    raise ValueError(f"Cannot parse boolean value: {value}")
+
+def build_intervals(
+    today: date | None = None,
+) -> list[tuple[str | None, str | None]]:
+    """
+    Build the (dateRangeBegin, dateRangeEnd) windows used to paginate the export.
+
+    Windows follow calendar quarters (ends: 31 Mar, 30 Jun, 30 Sep, 31 Dec) from
+    PAGINATE_FROM_YEAR. The first window has no begin, so it also covers anything
+    older than that year. The last window has no end, so it reaches the latest records.
+    Each window starts on the previous quarter-end day, so adjacent windows overlap
+    by one day and no record is lost whether REDCap treats the bounds as inclusive or
+    exclusive. transform() drops the resulting exact duplicate rows.
+    """
+    today = today or date.today()
+
+    # Quarter ends that have already passed split the timeline into windows.
+    boundaries: list[date] = []
+    year = PAGINATE_FROM_YEAR
+    done = False
+    while not done:
+        for month, day in QUARTER_ENDS:
+            quarter_end = date(year, month, day)
+            if quarter_end >= today:
+                done = True
+                break
+            boundaries.append(quarter_end)
+        year += 1
+
+    intervals: list[tuple[str | None, str | None]] = []
+    begin: str | None = None
+    for boundary in boundaries:
+        intervals.append((begin, f"{boundary.isoformat()} 23:59:59"))
+        begin = f"{boundary.isoformat()} 00:00:00"
+    intervals.append((begin, None))
+
+    return intervals
+
+
+def _export_records(token: str, begin: str | None, end: str | None) -> bytes:
+    """Export one window of records as raw CSV bytes."""
+    payload = {
+        "token": token,
+        "content": "record",
+        "action": "export",
+        "format": "csv",
+        "type": "flat",
+        "rawOrLabel": "raw",
+        "rawOrLabelHeaders": "raw",
+        "exportCheckboxLabel": "false",
+        "returnFormat": "json",
+    }
+    if begin:
+        payload["dateRangeBegin"] = begin
+    if end:
+        payload["dateRangeEnd"] = end
+
+    response = requests.post(REDCAP_ENDPOINT, data=payload, timeout=REQUEST_TIMEOUT)
+
+    # Do not log the payload or the response body: they hold the token and the data.
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"REDCap API request failed with status {response.status_code}"
+        )
+
+    return response.content
+
+
+def extract(today: date | None = None):
+    """Export every record of the REDCap project as a flat CSV, one quarter at a time."""
+    token = libssm.get_secret(REDCAP_TOKEN_PARAMETER_NAME)
+
+    header: bytes | None = None
+
+    # Write the raw bytes so quotes and newlines inside free-text fields stay intact.
+    with open(f"{OUT_PATH}__raw.csv", "wb") as f:
+        for begin, end in build_intervals(today):
+            print(f"Exporting records from {begin or 'the beginning'} to {end or 'latest'}")
+            content = _export_records(token, begin, end)
+
+            if not content.strip():
+                continue
+
+            # The header holds plain variable names, so the first line break ends it.
+            head, _, body = content.partition(b"\n")
+            head = head.rstrip(b"\r")
+
+            if header is None:
+                header = head
+                f.write(head + b"\n")
+            elif head != header:
+                raise RuntimeError("REDCap export header changed between intervals")
+
+            if body.strip():
+                f.write(body if body.endswith(b"\n") else body + b"\n")
+
+def transform() -> list[str]:
+    # treat all columns as string value, do not automatically infer the dataframe dtype
+    # https://stackoverflow.com/questions/77318631/how-to-read-all-columns-as-strings-in-polars
+    df = pl.read_csv(
+        f"{OUT_PATH}__raw.csv", infer_schema_length=False, infer_schema=False
+    )
+
+    # strip whitespaces, carriage return
+    df = df.with_columns(pl.col(pl.String).str.strip_chars())
+
+    # blank cells to null (after stripping, so whitespace-only cells count as blank)
+    df = df.with_columns(
+        pl.when(pl.col(pl.String).str.len_chars() == 0)
+        .then(None)
+        .otherwise(pl.col(pl.String))
+        .name.keep()
+    )
+
+    # drop row iff all values are null
+    df = df.filter(~pl.all_horizontal(pl.all().is_null()))
+
+    # Quarterly export windows overlap on the boundary day, so the same record can
+    # arrive twice. Drop exact whole-row duplicates only (never dedupe by record id:
+    # repeating instruments legitimately share one).
+    df = df.unique(keep="last", maintain_order=True)
+
+    # drop all unnamed (blank) columns
+    for col in df.columns:
+        if col.startswith("__UNNAMED__"):
+            df = df.drop(col)
+        if col.startswith("_duplicated"):
+            df = df.drop(col)
+        if col == "":
+            df = df.drop(col)
+
+    # REDCap variable names are already lowercase snake_case. Checkbox columns (field___1)
+    # and repeating instruments are kept as exported: reshaping belongs to later layers.
+
+    # Never truncate the target table and then load nothing.
+    if df.height == 0:
+        raise RuntimeError("REDCap export returned no records; refusing to load")
+
+    print(f"Exported {df.height} rows, {len(df.columns)} columns")
+    print(df.columns)
+
+    df.write_csv(f"{OUT_PATH}.csv")
+
+    # generate sql schema script
+    sql = ",\n".join(f'"{col}"\tvarchar(65535)' for col in df.columns)
+
+    sql_schema = f"""CREATE TABLE IF NOT EXISTS {OUT_NAME_DOT}
+    (
+    {sql}
+    );"""
+
+    with open(f"{OUT_PATH}.sql", "w", newline="") as f:
+        f.write(sql_schema)
+
+    print(sql_schema)
+
+    return df.columns
+
+def _wait_for_query(client, statement_id: str):
+    """Poll Redshift Data API until the statement reaches a terminal state."""
+    while True:
+        response = client.describe_statement(Id=statement_id)
+        status = response["Status"]
+
+        if status == "FINISHED":
+            print(f"Statement {statement_id} finished successfully.")
+            return
+        if status in ("FAILED", "ABORTED"):
+            raise RuntimeError(
+                f"Redshift Data API statement {statement_id} failed.\n"
+                f"Error: {response.get('Error')}"
+            )
+
+        print(f"Statement {statement_id} status: {status} — waiting...")
+        time.sleep(2)
+
+def upload_artifacts(bucket: str) -> str:
+    """Upload the generated CSV and SQL artefacts to S3 and return the CSV S3 URI."""
+
+    csv_file = f"{OUT_PATH}.csv"
+    sql_file = f"{OUT_PATH}.sql"
+
+    csv_s3_object_name = f"{S3_MID_PATH}/{os.path.basename(csv_file)}"
+    sql_s3_object_name = f"{S3_MID_PATH}/{os.path.basename(sql_file)}"
+
+    s3_client = libs3.s3_client()
+    s3_client.upload_file(csv_file, bucket, csv_s3_object_name)
+    s3_client.upload_file(sql_file, bucket, sql_s3_object_name)
+    print(f"Uploaded CSV  → s3://{bucket}/{csv_s3_object_name}")
+    print(f"Uploaded SQL  → s3://{bucket}/{sql_s3_object_name}")
+
+    return f"s3://{bucket}/{csv_s3_object_name}"
+
+def load_to_redshift(workgroup: str, role: str, s3_csv_uri: str, columns: list[str]):
+    """TRUNCATE the target table then COPY the staged CSV via the Redshift Data API."""
+
+    table_name = f"{SCHEMA_NAME}.{BASE_NAME}"
+
+    # Explicit column list in CSV order, so the export order cannot shift values
+    # into the wrong (all varchar) target columns.
+    column_list = ", ".join('"{}"'.format(c.replace('"', '""')) for c in columns)
+
+    truncate_sql = f"TRUNCATE TABLE {table_name};"
+
+    copy_sql = f"""
+        COPY {table_name} ({column_list})
+        FROM '{s3_csv_uri}'
+        IAM_ROLE '{role}'
+        FORMAT AS CSV
+        IGNOREHEADER 1
+        EMPTYASNULL
+        BLANKSASNULL
+        REGION '{REGION_NAME}';
+    """
+
+    client = boto3.client("redshift-data", region_name=REGION_NAME)
+
+    def run(sql: str):
+        """Submit one statement and block until it finishes (raises on failure)."""
+        response = client.execute_statement(
+            WorkgroupName=workgroup,
+            Database=DB_NAME,
+            Sql=sql,
+        )
+        _wait_for_query(client, response["Id"])
+
+    print(f"Truncating table: {table_name}")
+    run(truncate_sql)
+
+    print(f"Running COPY into: {table_name} from {s3_csv_uri}")
+    run(copy_sql)
+
+    print(f"Load complete → {table_name}")
+
+def load(bucket: str, workgroup: str, role: str, columns: list[str]):
+    """
+    Load staged CSV data into Redshift Serverless via:
+      1. Upload CSV and SQL artefacts to S3
+      2. TRUNCATE the target table
+      3. COPY from S3 into Redshift Serverless using the Data API
+    """
+
+    s3_csv_uri = upload_artifacts(bucket)
+    load_to_redshift(
+        workgroup=workgroup, role=role, s3_csv_uri=s3_csv_uri, columns=columns
+    )
+
+def clean_up():
+    # Remove the raw export: it may hold fields that are not in the transformed CSV.
+    raw_file = f"{OUT_PATH}__raw.csv"
+    if os.path.exists(raw_file):
+        os.remove(raw_file)
+
+class GlueRedcapCase(Job):
+    def __init__(self, glue_context: GlueContext):
+        super().__init__(glue_context)
+
+        self.glue_context: GlueContext = glue_context
+        self.spark: SparkSession = glue_context.spark_session
+
+        # Pass-in parameters
+        params = ["lz_bucket", "rs_workgroup", "rs_role"]
+
+        if "--JOB_NAME" in sys.argv:
+            params.append("JOB_NAME")
+        if "--base_name" in sys.argv:
+            params.append("base_name")
+        if "--s3_mid_path" in sys.argv:
+            params.append("s3_mid_path")
+        if "--dry_run" in sys.argv:
+            params.append("dry_run")
+
+        args = getResolvedOptions(sys.argv, params)
+
+        self.bucket = args["lz_bucket"]
+        self.workgroup = args["rs_workgroup"]
+        self.role = args["rs_role"]
+        self.dry_run = parse_bool(args.get("dry_run"))
+
+        job_name = args.get("JOB_NAME", "GlueRedcapCase")
+        self.init(job_name, args)
+
+        # Resolve optional parameters with defaults
+        global BASE_NAME, S3_MID_PATH, OUT_NAME, OUT_NAME_DOT, OUT_PATH
+
+        BASE_NAME = args.get("base_name", BASE_NAME_DEFAULT)
+        S3_MID_PATH = args.get("s3_mid_path", S3_MID_PATH_DEFAULT)
+
+        # Prepare out path with naming convention
+        OUT_NAME = f"{DB_NAME}_{SCHEMA_NAME}_{BASE_NAME}"
+        OUT_NAME_DOT = f"{DB_NAME}.{SCHEMA_NAME}.{BASE_NAME}"
+        OUT_PATH = f"/tmp/{OUT_NAME}"
+
+    def run(self):
+
+        extract()
+
+        columns = transform()
+
+        # Use --dry_run true to upload the artefacts without touching Redshift.
+        if self.dry_run:
+            upload_artifacts(self.bucket)
+            print("Dry run enabled: skipping Redshift load")
+        else:
+            load(
+                bucket=self.bucket,
+                workgroup=self.workgroup,
+                role=self.role,
+                columns=columns,
+            )
+
+        clean_up()
+
+        self.commit()
+
+if __name__ == "__main__":
+    session = SparkSession.builder.getOrCreate()
+    gc = GlueContext(session.sparkContext)
+    GlueRedcapCase(gc).run()
