@@ -31,8 +31,7 @@ mart_tables = config.get("mart-tables")
 # Granted SELECT on each new mart table. The swap drops the old table with its grants.
 mart_readers = config.require("mart-readers")
 shared_infra_path = config.require("shared-infra")
-# Default is 18:00 UTC = 04:00 AEST / 05:00 AEDT. Set it after the Redshift UNLOAD.
-schedule = config.get("schedule") or "cron(0 18 * * ? *)"
+# See Trigger in the README. Off unless set.
 trigger_enabled = config.get_bool("trigger-enabled")
 
 # `make wheels` downloads the wheels pinned in the requirements into this directory.
@@ -327,21 +326,36 @@ pulumi.export("mart_tables", loaded_tables)
 
 # --- Glue Trigger ---
 
-# Keep triggers opt-in so a stage can be validated manually before scheduling.
+# The OrcaVault run event starts the job, see Trigger in the README. EventBridge can't start a
+# Glue job, so its rule starts a workflow, whose EVENT trigger runs the job. Keep triggers opt-in
+# so a stage can be validated manually first.
 enable_trigger = trigger_enabled if trigger_enabled is not None else False
 
+glue_workflow = aws.glue.Workflow(
+    "glue-workflow",
+    name=f"{stack_prefix}-{stack_stage}-{job_name}-workflow",
+    description=f"Runs {job_name} after each OrcaVault {stack_stage} run that unloaded the mart",
+    # The job runs one at a time.
+    max_concurrent_runs=1,
+)
+
 glue_trigger = aws.glue.Trigger(
-    "glue-trigger",
+    "glue-event-trigger",
     name=pulumi.Output.from_input(glue_job.name).apply(
-        lambda name: f"{name}-scheduled-trigger"
+        lambda name: f"{name}-event-trigger"
     ),
-    type="SCHEDULED",
-    schedule=schedule,
+    type="EVENT",
+    workflow_name=glue_workflow.name,
     description=pulumi.Output.from_input(glue_job.name).apply(
-        lambda name: f"Daily trigger for {name}"
+        lambda name: (
+            f"Runs {name} after each OrcaVault {stack_stage} run that unloaded the mart"
+        )
     ),
     enabled=enable_trigger,
-    start_on_creation=enable_trigger,
+    # A run per event, rather than per batch.
+    event_batching_conditions=[
+        aws.glue.TriggerEventBatchingConditionArgs(batch_size=1)
+    ],
     actions=[
         aws.glue.TriggerActionArgs(
             job_name=glue_job.name,
@@ -349,5 +363,88 @@ glue_trigger = aws.glue.Trigger(
     ],
 )
 
+# A run of this stage that applied its models and unloaded the mart.
+run_unloaded_pattern = {
+    "source": ["orcahouse.orcavault"],
+    "detail-type": ["OrcaVaultRunFinished"],
+    "detail": {
+        "environment": [stack_stage],
+        "outcome": ["succeeded", "warned"],
+        "unloadOutcome": ["succeeded"],
+    },
+}
+
+start_rule = aws.cloudwatch.EventRule(
+    "start-rule",
+    name=f"{stack_prefix}-{stack_stage}-{job_name}-start",
+    description=f"Starts {job_name} after each OrcaVault {stack_stage} run that unloaded the mart",
+    event_bus_name="default",
+    event_pattern=json.dumps(run_unloaded_pattern),
+    state="ENABLED" if enable_trigger else "DISABLED",
+)
+
+# EventBridge notifies the workflow as this role, which only the rule can assume.
+start_role = aws.iam.Role(
+    "start-role",
+    name=f"{stack_prefix}-{stack_stage}-{job_name}-start-role",
+    assume_role_policy=start_rule.arn.apply(
+        lambda rule_arn: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"Service": "events.amazonaws.com"},
+                        "Action": "sts:AssumeRole",
+                        "Condition": {
+                            "StringEquals": {"aws:SourceAccount": account},
+                            "ArnEquals": {"aws:SourceArn": rule_arn},
+                        },
+                    }
+                ],
+            }
+        )
+    ),
+)
+
+start_policy = aws.iam.RolePolicy(
+    "start-policy",
+    name=f"{stack_prefix}-{stack_stage}-{job_name}-start-policy",
+    role=start_role.id,
+    policy=glue_workflow.arn.apply(
+        lambda workflow_arn: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "StartWorkflow",
+                        "Effect": "Allow",
+                        "Action": ["glue:NotifyEvent"],
+                        "Resource": [workflow_arn],
+                    }
+                ],
+            }
+        )
+    ),
+)
+
+aws.cloudwatch.EventTarget(
+    "start-target",
+    rule=start_rule.name,
+    event_bus_name="default",
+    target_id="glue-workflow",
+    arn=glue_workflow.arn,
+    role_arn=start_role.arn,
+    # Retries notifying the workflow, not the job, for an hour.
+    retry_policy=aws.cloudwatch.EventTargetRetryPolicyArgs(
+        maximum_event_age_in_seconds=3600,
+        maximum_retry_attempts=185,
+    ),
+    # So no event arrives before the role's policy and the trigger exist.
+    opts=pulumi.ResourceOptions(depends_on=[start_policy, glue_trigger]),
+)
+
+pulumi.export("glue_workflow_name", glue_workflow.name)
 pulumi.export("glue_trigger_name", glue_trigger.name)
 pulumi.export("glue_trigger_enabled", enable_trigger)
+pulumi.export("start_rule_name", start_rule.name)

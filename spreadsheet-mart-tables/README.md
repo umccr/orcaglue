@@ -10,6 +10,7 @@
     - [Known Limitations](#known-limitations)
   - [Deployment](#deployment)
     - [Network and Login](#network-and-login)
+    - [Trigger](#trigger)
   - [Aurora Setup](#aurora-setup)
     - [Ownership](#ownership)
     - [Mart DDL](#mart-ddl)
@@ -44,8 +45,9 @@ It runs in the Aurora cluster's VPC through a Glue network connection, and logs 
 as `dbuser_rw` with IAM database authentication over TLS. See
 [Network and Login](#network-and-login).
 
-The job doesn't run the UNLOAD. That is a separate step in OrcaHouse, and this job consumes its
-output.
+The job doesn't run the UNLOAD. The OrcaVault daily run does, see
+[The unload](https://github.com/umccr/orcahouse/tree/main/infra/orcavault-run#the-unload), and
+then starts the job, see [Trigger](#trigger).
 
 ### Input Contract
 
@@ -100,7 +102,7 @@ Then, for each table, in its own session and one transaction:
    that changed without `job/mart_tables.json` being regenerated. For about 2 minutes after
    Aurora resumes from 0 ACU, it doesn't have the `s3Import` role's credentials, and an import
    fails with `XX000 unable to access credentials stored with the database instance`. A
-   scheduled run usually finds Aurora paused, so its first import waits this out. The job rolls
+   triggered run usually finds Aurora paused, so its first import waits this out. The job rolls
    that import back to a savepoint, which keeps the parts already imported, and retries it
    every 10 s for up to 5 minutes. Later imports in the run don't wait.
 4. Check that the shadow table's row count equals the sum of the rows reported by the imports.
@@ -189,6 +191,7 @@ are deployed and destroyed with the job:
 | Security group `orcaglue-<stage>-spreadsheet-mart-tables-sg` | The job's network rules. See [Network and Login](#network-and-login) |
 | Glue connection `orcaglue-<stage>-spreadsheet-mart-tables-vpc` | A `NETWORK` connection in `glue-subnet`, which runs the job in the Aurora VPC |
 | The wheels, the RDS CA bundle and the DDL file | Uploaded next to the job script in the landing zone |
+| Workflow `orcaglue-<stage>-spreadsheet-mart-tables-workflow`, its trigger, rule `orcaglue-<stage>-spreadsheet-mart-tables-start` and its role | Start the job. See [Trigger](#trigger) |
 
 | Statement | Grants |
 |---|---|
@@ -217,12 +220,37 @@ Module-specific config, in [Pulumi.dev.yaml](Pulumi.dev.yaml):
 | `glue-subnet` | `UomPrimaryPrivateSubnetA` | The `Name` tag of the private subnet for the Glue connection, in the Aurora writer's AZ |
 | `mart-tables` | Not set | Optional. The tables to load, each in `job/mart_tables.json`. Without it, the job loads every table in that file. Neither stack sets it; see [Mart DDL](#mart-ddl) |
 | `mart-readers` | `dbuser_ro` | The roles granted `SELECT` on each new table |
-| `trigger-enabled` | `"false"` | The schedule stays off until the UNLOAD is scheduled and a manual run is validated |
-| `schedule` | `cron(0 18 * * ? *)` | 04:00 AEST / 05:00 AEDT. Set it to run after the UNLOAD |
+| `trigger-enabled` | `"false"` | Turns on the [Trigger](#trigger), once the stage's unload has succeeded |
 
 Deploy the `prod` stack only once Aurora `orcanexus-prod` exists and `04_rw.sql` has run on it.
 Before its first deploy, check that `glue-subnet` is in the Aurora writer's AZ. Before its first
 run, check that the prod UNLOAD has written a manifest for each table it loads.
+
+### Trigger
+
+The job starts after each OrcaVault run of its stage that unloaded the mart, from its
+[run event](https://github.com/umccr/orcahouse/tree/main/infra/orcavault-run#the-run-event).
+EventBridge can't start a Glue job, so the rule `orcaglue-<stage>-spreadsheet-mart-tables-start`
+starts the workflow `orcaglue-<stage>-spreadsheet-mart-tables-workflow`, whose `EVENT` trigger
+runs the job. The rule matches:
+
+```json
+{
+  "source": ["orcahouse.orcavault"],
+  "detail-type": ["OrcaVaultRunFinished"],
+  "detail": {
+    "environment": ["<stage>"],
+    "outcome": ["succeeded", "warned"],
+    "unloadOutcome": ["succeeded"]
+  }
+}
+```
+
+- **One run at a time.** A run started by hand while a triggered one is going, such as just after
+  the 03:00 Melbourne time OrcaVault run, fails with `ConcurrentRunsExceededException`.
+- **A table that isn't in the DDL file** is unloaded but not loaded, and is listed in the
+  summary's `unlisted_tables`. See [Mart DDL](#mart-ddl).
+- **`trigger-enabled`** switches both the rule and the trigger.
 
 ### Network and Login
 
@@ -311,6 +339,12 @@ See [README_GLUE_JOB.md](../README_GLUE_JOB.md).
 aws glue start-job-run --job-name orcaglue-dev-spreadsheet-mart-tables-job
 ```
 
+Runs started by the [Trigger](#trigger) are the workflow's:
+
+```bash
+aws glue get-workflow-runs --name orcaglue-dev-spreadsheet-mart-tables-workflow --max-results 5
+```
+
 A dry run reads the manifests, sets `Content-Encoding` on the parts and writes the summary,
 without touching Aurora:
 
@@ -356,7 +390,8 @@ make test
 
 ## Destroy
 
-See [Teardown](../README_DEPLOY.md#teardown). The security group and the Glue connection are
-part of the stack. The Aurora tables, the `mart_stg` schema and the `dbuser_rw` login are not.
+See [Teardown](../README_DEPLOY.md#teardown). The security group, the Glue connection and the
+trigger's resources are part of the stack. The Aurora tables, the `mart_stg` schema and the
+`dbuser_rw` login are not.
 To retire the module, drop the tables as `dbuser_rw`, their owner, then the login and the schema
 as `sadmin`.
