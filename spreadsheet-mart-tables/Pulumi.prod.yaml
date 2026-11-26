@@ -24,9 +24,7 @@ config:
   # prod Redshift mart had all 10, with the same columns as dev's. See Mart DDL in the README.
   # Granted SELECT on each new mart table at every swap. Hand-made grants go with the old table.
   spreadsheet-mart-tables:mart-readers: dbuser_ro
-  # Triggers are opt-in. Leave false until a manual run is validated.
+  # See Trigger in the README. Leave false until the OrcaVault unload has succeeded in prod.
   spreadsheet-mart-tables:trigger-enabled: "false"
-  # 18:00 UTC = 04:00 AEST / 05:00 AEDT. A placeholder, to be set after the UNLOAD schedule.
-  spreadsheet-mart-tables:schedule: cron(0 18 * * ? *)
 secretsprovider: awskms://alias/pulumi-state-key # pragma: allowlist secret
 encryptedkey: AQICAHjiIoInMawFdg3zsGPUuqK2Y2wKhSCcloZUamCbvHLzOQENeqwurM3nTYaBuNiLYuCxAAAAfjB8BgkqhkiG9w0BBwagbzBtAgEAMGgGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMrZA0CD/apFJt4WDpAgEQgDv1EQXZo9zVxz8k8yW8EpHhOVNNI/9nkDJjBoUAD5m3KpgPllGccjanGC4UbBl5vSWEe05A9w+7aZ5ejA== # pragma: allowlist secret
